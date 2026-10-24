@@ -36,7 +36,9 @@ import {
   fetchSuppliers,
   fetchIncomingOrders,
   fetchReorderRequests,
-  fetchAuditEvents
+  fetchAuditEvents,
+  verifySupabaseConnection,
+  SupabaseConnectionStatus
 } from '../services/supabaseClient';
 
 interface AppContextType {
@@ -52,9 +54,13 @@ interface AppContextType {
   isTestRunning: boolean;
   activeNotificationsCount: number;
   isBackendConfigured: boolean;
+  isSupabaseLiveConnected: boolean;
+  supabaseConnectionStatus: SupabaseConnectionStatus;
+  supabaseVerifiedAt: string | null;
   supabaseConfigError: string | null;
   migrationNotice: string | null;
   isOnboardingPreview: boolean;
+  recheckSupabaseConnection: () => Promise<void>;
   // Actions
   setSelectedSku: (sku: string) => void;
   addInventoryItem: (item: Omit<InventoryItem, 'id' | 'updatedAt' | 'sourceType'>) => void;
@@ -130,6 +136,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const [supabaseConfigError, setSupabaseConfigError] = useState<string | null>(null);
   const [migrationNotice, setMigrationNotice] = useState<string | null>(null);
+  const [supabaseConnectionStatus, setSupabaseConnectionStatus] = useState<SupabaseConnectionStatus>(() => {
+    const cfg = getBackendConfig();
+    if (cfg.isMisconfigured) return 'config_error';
+    if (!cfg.isSupabaseConfigured) return 'unconfigured';
+    return 'checking';
+  });
+  const [supabaseVerifiedAt, setSupabaseVerifiedAt] = useState<string | null>(null);
 
   const clearAllSessionData = () => {
     InventoryService.clearState();
@@ -148,8 +161,53 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setTestResults({ TC1: null, TC2: null, TC3: null, TC4: null });
   };
 
+  const recheckSupabaseConnection = async () => {
+    const cfg = getBackendConfig();
+    if (cfg.isMisconfigured) {
+      setSupabaseConnectionStatus('config_error');
+      setSupabaseConfigError(cfg.configError || 'Invalid Supabase configuration.');
+      setSupabaseVerifiedAt(new Date().toISOString());
+      return;
+    }
+    if (!cfg.isSupabaseConfigured) {
+      setSupabaseConnectionStatus('unconfigured');
+      setSupabaseConfigError(null);
+      setSupabaseVerifiedAt(new Date().toISOString());
+      return;
+    }
+
+    setSupabaseConnectionStatus('checking');
+    const health = await verifySupabaseConnection();
+    setSupabaseConnectionStatus(health.status);
+    setSupabaseVerifiedAt(health.verifiedAt);
+
+    if (health.status === 'connected') {
+      setSupabaseConfigError(null);
+      if (health.migrationRequired) {
+        setMigrationNotice(
+          'PostgreSQL database tables not detected. Please run the SQL migrations in the Supabase SQL Editor to activate live storage.'
+        );
+      } else {
+        setMigrationNotice(null);
+      }
+      await loadAuthorizedBackendData();
+    } else if (health.error) {
+      setSupabaseConfigError(health.error);
+    }
+  };
+
   const loadAuthorizedBackendData = async () => {
-    if (!isSupabaseReady()) return;
+    const cfg = getBackendConfig();
+    if (cfg.isMisconfigured) {
+      setSupabaseConnectionStatus('config_error');
+      setSupabaseConfigError(cfg.configError);
+      return;
+    }
+    if (!isSupabaseReady()) {
+      setSupabaseConnectionStatus('unconfigured');
+      setSupabaseConfigError(null);
+      return;
+    }
 
     const [invRes, supRes, ordRes, reqRes, audRes] = await Promise.all([
       fetchInventoryItems(),
@@ -161,11 +219,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     if (invRes.error) {
       if (invRes.migrationRequired) {
+        setSupabaseConnectionStatus('connected');
+        setSupabaseConfigError(null);
         setMigrationNotice(invRes.error);
       } else {
+        setSupabaseConnectionStatus('config_error');
         setSupabaseConfigError(invRes.error);
       }
-    } else {
+    } else if (invRes.isConnected) {
+      setSupabaseConnectionStatus('connected');
+      setSupabaseConfigError(null);
+      setSupabaseVerifiedAt(new Date().toISOString());
+      if (invRes.migrationRequired) {
+        setMigrationNotice(
+          'PostgreSQL database tables not detected. Please run the SQL migrations in the Supabase SQL Editor to activate live storage.'
+        );
+      } else {
+        setMigrationNotice(null);
+      }
       setInventory(invRes.items);
       if (invRes.items.length > 0) {
         setSelectedSku(prev => prev || invRes.items[0].sku);
@@ -201,11 +272,33 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   useEffect(() => {
     const config = getBackendConfig();
     if (config.isMisconfigured && config.configError) {
+      setSupabaseConnectionStatus('config_error');
       setSupabaseConfigError(config.configError);
       return;
     }
 
+    if (!config.isSupabaseConfigured) {
+      setSupabaseConnectionStatus('unconfigured');
+      setSupabaseConfigError(null);
+      return;
+    }
+
     if (isSupabaseReady()) {
+      verifySupabaseConnection().then((health) => {
+        setSupabaseConnectionStatus(health.status);
+        setSupabaseVerifiedAt(health.verifiedAt);
+        if (health.status === 'connected') {
+          setSupabaseConfigError(null);
+          if (health.migrationRequired) {
+            setMigrationNotice(
+              'PostgreSQL database tables not detected. Please run the SQL migrations in the Supabase SQL Editor to activate live storage.'
+            );
+          }
+        } else if (health.error) {
+          setSupabaseConfigError(health.error);
+        }
+      });
+
       getCurrentUserProfile().then(profile => {
         if (profile) {
           setCurrentUser(profile);
@@ -686,7 +779,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     clearAllSessionData();
   };
 
-  const isBackendConfigured = getBackendConfig().isSupabaseConfigured;
+  const isSupabaseLiveConnected = supabaseConnectionStatus === 'connected';
+  const isBackendConfigured =
+    getBackendConfig().isSupabaseConfigured &&
+    supabaseConnectionStatus !== 'config_error' &&
+    supabaseConnectionStatus !== 'connection_failed' &&
+    !supabaseConfigError;
 
   return (
     <AppContext.Provider
@@ -703,9 +801,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         isTestRunning,
         activeNotificationsCount,
         isBackendConfigured,
+        isSupabaseLiveConnected,
+        supabaseConnectionStatus,
+        supabaseVerifiedAt,
         supabaseConfigError,
         migrationNotice,
         isOnboardingPreview,
+        recheckSupabaseConnection,
         setSelectedSku,
         addInventoryItem,
         updateInventoryItem,

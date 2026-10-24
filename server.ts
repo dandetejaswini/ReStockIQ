@@ -1,50 +1,196 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import fs from 'fs';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { verifyFirebaseIdToken, VerifiedFirebaseToken } from './src/server/firebaseVerifier';
+import { verifyFirebaseIdToken, VerifiedFirebaseToken } from './src/server/firebaseVerifier.js';
 
 const PORT = Number(process.env.PORT || 3000);
 
+function sanitizeServerEnv(raw: string | undefined): string {
+  if (!raw) return '';
+  let cleaned = raw.trim();
+  if (
+    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+    (cleaned.startsWith("'") && cleaned.endsWith("'")) ||
+    (cleaned.startsWith('`') && cleaned.endsWith('`'))
+  ) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+  if (cleaned.toLowerCase().startsWith('bearer ')) {
+    cleaned = cleaned.slice(7).trim();
+  }
+  const lower = cleaned.toLowerCase();
+  if (
+    !cleaned ||
+    lower === 'undefined' ||
+    lower === 'null' ||
+    lower.includes('placeholder') ||
+    lower.startsWith('your_') ||
+    lower.startsWith('<your') ||
+    lower.includes('your_supabase_') ||
+    lower.includes('your_shared_') ||
+    lower.includes('your_deployment_id') ||
+    lower.includes('your-production-domain') ||
+    lower.includes('_key_here') ||
+    lower.includes('_secret_here') ||
+    lower === 'changeme'
+  ) {
+    return '';
+  }
+  return cleaned;
+}
+
+function maskEmailForLogs(email: string): string {
+  const clean = String(email || '').trim().toLowerCase();
+  const parts = clean.split('@');
+  if (parts.length !== 2) return '***';
+  const [local, domain] = parts;
+  if (local.length <= 2) return `${local[0] || '*'}*@${domain}`;
+  return `${local[0]}***${local[local.length - 1]}@${domain}`;
+}
+
+export interface WelcomeEmailDiagnosticTrace {
+  traceId: string;
+  timestamp: string;
+  firebaseUid: string;
+  maskedEmail: string;
+  idempotencyKey: string;
+  stages: {
+    stage1_signup_completed: {
+      completed: boolean;
+      isSignupRequest: boolean;
+      provider: string;
+    };
+    stage2_welcome_trigger_invoked: {
+      invoked: boolean;
+      endpoint: string;
+    };
+    stage3_vercel_endpoint_accepted: {
+      accepted: boolean;
+      isNewAccount: boolean;
+      welcomeQueued: boolean;
+      queueId: string | null;
+      alreadySent: boolean;
+    };
+    stage4_apps_script_processed: {
+      attempted: boolean;
+      accepted: boolean;
+      httpStatus?: number;
+      errorCode?: string | null;
+      errorMessage?: string | null;
+    };
+    stage5_email_provider_accepted: {
+      dispatched: boolean;
+      providerStatus: string;
+    };
+    stage6_final_status_recorded: {
+      recorded: boolean;
+      finalStatus: 'SENT' | 'SKIPPED' | 'PENDING' | 'FAILED' | 'NOT_NEEDED';
+      errorMessage?: string | null;
+    };
+  };
+}
+
+const RECENT_DIAGNOSTIC_TRACES: WelcomeEmailDiagnosticTrace[] = [];
+const MAX_DIAGNOSTIC_TRACES = 25;
+
+function recordDiagnosticTrace(trace: WelcomeEmailDiagnosticTrace) {
+  RECENT_DIAGNOSTIC_TRACES.unshift(trace);
+  if (RECENT_DIAGNOSTIC_TRACES.length > MAX_DIAGNOSTIC_TRACES) {
+    RECENT_DIAGNOSTIC_TRACES.pop();
+  }
+  const finalStatus = trace.stages.stage6_final_status_recorded.finalStatus;
+  const logLine = JSON.stringify({
+    service: 'ReStockIQ-WelcomeEmailLifecycle',
+    traceId: trace.traceId,
+    timestamp: trace.timestamp,
+    firebaseUid: trace.firebaseUid,
+    maskedEmail: trace.maskedEmail,
+    idempotencyKey: trace.idempotencyKey,
+    finalStatus,
+    stages: trace.stages,
+  });
+  if (finalStatus === 'FAILED') {
+    console.error(logLine);
+  } else {
+    console.info(logLine);
+  }
+}
+
 export function getServerSupabaseConfig() {
+  const explicitSupabaseUrl = sanitizeServerEnv(process.env.SUPABASE_URL);
+  const viteSupabaseUrl = sanitizeServerEnv(process.env.VITE_SUPABASE_URL);
+  const nextPublicSupabaseUrl = sanitizeServerEnv(process.env.NEXT_PUBLIC_SUPABASE_URL);
+
   const supabaseUrl = (
-    process.env.SUPABASE_URL ||
-    process.env.NEXT_PUBLIC_SUPABASE_URL ||
-    process.env.VITE_SUPABASE_URL ||
-    ''
-  )
-    .trim()
-    .replace(/\/+$/, '');
+    explicitSupabaseUrl ||
+    viteSupabaseUrl ||
+    nextPublicSupabaseUrl ||
+    'https://tewaaznazgsmaherddeu.supabase.co'
+  ).replace(/\/+$/, '');
 
-  const serviceRoleKey = (
-    process.env.SUPABASE_SECRET_KEY ||
-    process.env.SUPABASE_SERVICE_ROLE_KEY ||
-    ''
-  ).trim();
+  const serviceRoleKey =
+    sanitizeServerEnv(process.env.SUPABASE_SECRET_KEY) ||
+    sanitizeServerEnv(process.env.SUPABASE_SERVICE_ROLE_KEY) ||
+    '';
 
-  const publishableKey = (
-    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
-    process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
-    process.env.VITE_SUPABASE_ANON_KEY ||
-    ''
-  ).trim();
+  const publishableCandidates = [
+    sanitizeServerEnv(process.env.VITE_SUPABASE_ANON_KEY),
+    sanitizeServerEnv(process.env.VITE_SUPABASE_PUBLISHABLE_KEY),
+    sanitizeServerEnv(process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY),
+    sanitizeServerEnv(process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY),
+  ].filter(Boolean);
 
-  const appsScriptUrl = (
-    process.env.STOCKPILOT_APPS_SCRIPT_URL ||
-    process.env.APPS_SCRIPT_WEB_APP_URL ||
-    ''
-  ).trim();
+  const publishableKey = publishableCandidates[0] || '';
 
-  const appsScriptSecret = (
-    process.env.STOCKPILOT_APPS_SCRIPT_SECRET || ''
-  ).trim();
+  const appsScriptUrl =
+    sanitizeServerEnv(process.env.STOCKPILOT_APPS_SCRIPT_URL) ||
+    sanitizeServerEnv(process.env.APPS_SCRIPT_WEB_APP_URL) ||
+    sanitizeServerEnv(process.env.GOOGLE_APPS_SCRIPT_URL) ||
+    '';
+
+  const appsScriptSecret =
+    sanitizeServerEnv(process.env.STOCKPILOT_APPS_SCRIPT_SECRET) ||
+    sanitizeServerEnv(process.env.APPS_SCRIPT_SECRET) ||
+    sanitizeServerEnv(process.env.GOOGLE_APPS_SCRIPT_SECRET) ||
+    '';
+
+  const vercelProdUrl = sanitizeServerEnv(process.env.VERCEL_PROJECT_PRODUCTION_URL);
+  const vercelBranchUrl = sanitizeServerEnv(process.env.VERCEL_URL);
+  const explicitAppUrl =
+    sanitizeServerEnv(process.env.STOCKPILOT_APP_URL) ||
+    sanitizeServerEnv(process.env.APP_URL) ||
+    '';
 
   const appUrl = (
-    process.env.STOCKPILOT_APP_URL ||
-    process.env.APP_URL ||
-    ''
-  ).trim();
+    explicitAppUrl ||
+    (vercelProdUrl ? `https://${vercelProdUrl.replace(/^https?:\/\//, '')}` : '') ||
+    (vercelBranchUrl ? `https://${vercelBranchUrl.replace(/^https?:\/\//, '')}` : '')
+  ).replace(/\/+$/, '');
+
+  const isAppsScriptUrlValidFormat =
+    appsScriptUrl.startsWith('https://script.google.com/macros/s/') &&
+    appsScriptUrl.endsWith('/exec');
+  const isAppsScriptDevUrl =
+    appsScriptUrl.startsWith('https://script.google.com/macros/s/') &&
+    appsScriptUrl.endsWith('/dev');
+
+  const missingProductionEnvVars: string[] = [];
+  if (!explicitSupabaseUrl && !viteSupabaseUrl && !nextPublicSupabaseUrl) {
+    missingProductionEnvVars.push('SUPABASE_URL');
+  }
+  if (!serviceRoleKey) {
+    missingProductionEnvVars.push('SUPABASE_SECRET_KEY');
+  }
+  if (!appsScriptUrl) {
+    missingProductionEnvVars.push('STOCKPILOT_APPS_SCRIPT_URL');
+  }
+  if (!appsScriptSecret) {
+    missingProductionEnvVars.push('STOCKPILOT_APPS_SCRIPT_SECRET');
+  }
+  if (!explicitAppUrl) {
+    missingProductionEnvVars.push('STOCKPILOT_APP_URL');
+  }
 
   return {
     supabaseUrl,
@@ -52,32 +198,104 @@ export function getServerSupabaseConfig() {
     publishableKey,
     activeSupabaseKey: serviceRoleKey || publishableKey,
     hasServiceRoleKey: Boolean(serviceRoleKey),
+    hasPublishableKey: Boolean(publishableKey),
     hasAppsScriptWebhook: Boolean(appsScriptUrl && appsScriptSecret),
     appsScriptUrl,
     appsScriptSecret,
+    isAppsScriptUrlValidFormat,
+    isAppsScriptDevUrl,
     appUrl,
+    explicitVariablesStatus: {
+      SUPABASE_URL: Boolean(explicitSupabaseUrl || viteSupabaseUrl || nextPublicSupabaseUrl),
+      SUPABASE_SECRET_KEY: Boolean(serviceRoleKey),
+      STOCKPILOT_APPS_SCRIPT_URL: Boolean(appsScriptUrl),
+      STOCKPILOT_APPS_SCRIPT_SECRET: Boolean(appsScriptSecret),
+      STOCKPILOT_APP_URL: Boolean(explicitAppUrl),
+    },
+    missingProductionEnvVars,
   };
 }
 
-let cachedSupabaseClient: SupabaseClient | null = null;
-let cachedKeyUsed = '';
+const supabaseClientCache = new Map<string, SupabaseClient>();
 
-function getServerSupabase(): SupabaseClient | null {
-  const cfg = getServerSupabaseConfig();
-  if (!cfg.supabaseUrl || !cfg.activeSupabaseKey) {
-    return null;
-  }
-  if (cachedSupabaseClient && cachedKeyUsed === cfg.activeSupabaseKey) {
-    return cachedSupabaseClient;
-  }
-  cachedKeyUsed = cfg.activeSupabaseKey;
-  cachedSupabaseClient = createClient(cfg.supabaseUrl, cfg.activeSupabaseKey, {
+function createSupabaseClientForKey(url: string, key: string): SupabaseClient {
+  const cacheKey = `${url}::${key}`;
+  const existing = supabaseClientCache.get(cacheKey);
+  if (existing) return existing;
+
+  const client = createClient(url, key, {
     auth: {
       persistSession: false,
       autoRefreshToken: false,
     },
   });
-  return cachedSupabaseClient;
+  supabaseClientCache.set(cacheKey, client);
+  return client;
+}
+
+function getServerSupabase(preferPublicKey = false): SupabaseClient | null {
+  const cfg = getServerSupabaseConfig();
+  const keyToUse = preferPublicKey
+    ? cfg.publishableKey || cfg.serviceRoleKey
+    : cfg.serviceRoleKey || cfg.publishableKey;
+  if (!cfg.supabaseUrl || !keyToUse) {
+    return null;
+  }
+  return createSupabaseClientForKey(cfg.supabaseUrl, keyToUse);
+}
+
+/**
+ * Executes a SECURITY DEFINER RPC on Supabase using the primary server key (SUPABASE_SECRET_KEY),
+ * and automatically retries with the public key (VITE_SUPABASE_ANON_KEY / VITE_SUPABASE_PUBLISHABLE_KEY)
+ * if the primary key is missing, invalid, or rejected with 401/403.
+ */
+async function callSupabaseRpcWithFallback<T = any>(
+  rpcName: string,
+  params: Record<string, any>
+): Promise<{ data: T | null; error: any; clientUsed: SupabaseClient | null }> {
+  const cfg = getServerSupabaseConfig();
+  const primaryClient = getServerSupabase(false);
+  if (!primaryClient) {
+    return {
+      data: null,
+      error: { message: 'Supabase is not configured on the server.' },
+      clientUsed: null,
+    };
+  }
+
+  const primaryRes = await primaryClient.rpc(rpcName, params);
+  if (!primaryRes.error) {
+    return {
+      data: primaryRes.data as T,
+      error: null,
+      clientUsed: primaryClient,
+    };
+  }
+
+  const errMsg = String(primaryRes.error?.message || '').toLowerCase();
+  const isKeyAuthError =
+    errMsg.includes('invalid api key') ||
+    errMsg.includes('jwt') ||
+    primaryRes.status === 401 ||
+    primaryRes.status === 403;
+
+  if (isKeyAuthError && cfg.hasServiceRoleKey && cfg.hasPublishableKey) {
+    const fallbackClient = getServerSupabase(true);
+    if (fallbackClient && fallbackClient !== primaryClient) {
+      const retryRes = await fallbackClient.rpc(rpcName, params);
+      return {
+        data: retryRes.data as T,
+        error: retryRes.error,
+        clientUsed: fallbackClient,
+      };
+    }
+  }
+
+  return {
+    data: primaryRes.data as T,
+    error: primaryRes.error,
+    clientUsed: primaryClient,
+  };
 }
 
 async function authenticateRequest(req: Request): Promise<VerifiedFirebaseToken> {
@@ -88,32 +306,512 @@ async function authenticateRequest(req: Request): Promise<VerifiedFirebaseToken>
   return verifyFirebaseIdToken(authHeader);
 }
 
-async function resolveVerifiedOrganization(
-  supabase: SupabaseClient,
-  verifiedUser: VerifiedFirebaseToken
-): Promise<{ organizationId: string; profileId: string }> {
-  // First attempt canonical workspace sync/lookup RPC
-  const { data: syncData, error: rpcError } = await supabase.rpc(
+export interface WebhookDispatchResult {
+  triggered: boolean;
+  dispatched: boolean;
+  status: 'SENT' | 'SKIPPED' | 'FAILED' | 'QUEUED_FOR_APPS_SCRIPT_POLLER';
+  httpStatus?: number;
+  errorCode?: string;
+  error?: string;
+  remainingDailyQuota?: number;
+}
+
+export async function triggerAppsScriptWebhook(
+  payload: Record<string, any>
+): Promise<WebhookDispatchResult> {
+  const cfg = getServerSupabaseConfig();
+  if (!cfg.hasAppsScriptWebhook) {
+    const missingVars: string[] = [];
+    if (!cfg.appsScriptUrl) missingVars.push('STOCKPILOT_APPS_SCRIPT_URL');
+    if (!cfg.appsScriptSecret) missingVars.push('STOCKPILOT_APPS_SCRIPT_SECRET');
+    return {
+      triggered: false,
+      dispatched: false,
+      status: 'QUEUED_FOR_APPS_SCRIPT_POLLER',
+      errorCode: 'MISSING_APPS_SCRIPT_ENV',
+      error: `Missing Vercel server environment variable(s): ${missingVars.join(', ')}. Welcome email is queued as PENDING in public.email_queue.`,
+    };
+  }
+
+  if (cfg.isAppsScriptDevUrl) {
+    return {
+      triggered: false,
+      dispatched: false,
+      status: 'FAILED',
+      errorCode: 'INVALID_APPS_SCRIPT_DEV_URL',
+      error:
+        'STOCKPILOT_APPS_SCRIPT_URL ends with "/dev" instead of "/exec". Use the production Web App "/exec" deployment URL with access set to "Anyone".',
+    };
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 18000);
+
+    const res = await fetch(cfg.appsScriptUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        ...payload,
+        appUrl: payload.appUrl || cfg.appUrl || undefined,
+        secret: cfg.appsScriptSecret,
+      }),
+      redirect: 'follow',
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeoutId));
+
+    const text = (await res.text()).trim();
+
+    // Detect HTML responses (e.g. Google login page when Web App access is not "Anyone", or Apps Script HTML exception page)
+    if (
+      text.startsWith('<!DOCTYPE') ||
+      text.startsWith('<html') ||
+      text.includes('accounts.google.com') ||
+      text.includes('ServiceLogin')
+    ) {
+      const isLoginRedirect =
+        text.includes('accounts.google.com') ||
+        text.includes('ServiceLogin') ||
+        res.url?.includes('accounts.google.com');
+
+      return {
+        triggered: true,
+        dispatched: false,
+        status: 'FAILED',
+        httpStatus: res.status,
+        errorCode: isLoginRedirect ? 'APPS_SCRIPT_ACCESS_DENIED' : 'APPS_SCRIPT_HTML_ERROR',
+        error: isLoginRedirect
+          ? 'Google Apps Script returned a sign-in page instead of JSON. In Apps Script > Deploy > Manage deployments, set "Execute as: Me" and "Who has access: Anyone".'
+          : `Google Apps Script returned an HTML error response (HTTP ${res.status}). Verify the latest Code.gs is deployed as a Web App.`,
+      };
+    }
+
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return {
+        triggered: true,
+        dispatched: false,
+        status: 'FAILED',
+        httpStatus: res.status,
+        errorCode: 'APPS_SCRIPT_INVALID_JSON',
+        error: `Apps Script returned non-JSON response (HTTP ${res.status}): ${text.slice(0, 180)}`,
+      };
+    }
+
+    if (!res.ok || parsed?.success === false || parsed?.status === 'FAILED') {
+      const errText =
+        parsed?.error ||
+        parsed?.message ||
+        `Apps Script webhook rejected request (HTTP ${res.status})`;
+      const isUnauthorized = String(errText).toLowerCase().includes('unauthorized');
+      return {
+        triggered: true,
+        dispatched: false,
+        status: 'FAILED',
+        httpStatus: res.status,
+        errorCode: isUnauthorized ? 'APPS_SCRIPT_SECRET_MISMATCH' : 'APPS_SCRIPT_EXECUTION_ERROR',
+        error: errText,
+      };
+    }
+
+    // Check explicit delivery confirmation for SEND_WELCOME_EMAIL
+    if (payload.action === 'SEND_WELCOME_EMAIL') {
+      if (parsed?.status === 'SENT' || (typeof parsed?.sent === 'number' && parsed.sent > 0)) {
+        return {
+          triggered: true,
+          dispatched: true,
+          status: 'SENT',
+          httpStatus: res.status,
+          remainingDailyQuota: parsed?.remainingDailyQuota,
+        };
+      }
+
+      if (
+        parsed?.status === 'SKIPPED' ||
+        (typeof parsed?.skipped === 'number' && parsed.skipped > 0 && !parsed?.failed)
+      ) {
+        return {
+          triggered: true,
+          dispatched: false,
+          status: 'SKIPPED',
+          httpStatus: res.status,
+        };
+      }
+
+      // If Apps Script fell through to processPendingEmailQueueInternal_ and processed 0 rows
+      return {
+        triggered: true,
+        dispatched: false,
+        status: 'FAILED',
+        httpStatus: res.status,
+        errorCode: 'APPS_SCRIPT_NO_EMAIL_SENT',
+        error:
+          parsed?.error ||
+          parsed?.message ||
+          'Apps Script webhook completed without sending the welcome email (0 rows processed). Verify SUPABASE_SECRET_KEY in Apps Script Script Properties and redeploy Code.gs.',
+      };
+    }
+
+    return {
+      triggered: true,
+      dispatched: true,
+      status: parsed?.status || 'SENT',
+      httpStatus: res.status,
+      remainingDailyQuota: parsed?.remainingDailyQuota,
+    };
+  } catch (err: any) {
+    const isTimeout = err?.name === 'AbortError';
+    return {
+      triggered: true,
+      dispatched: false,
+      status: 'FAILED',
+      errorCode: isTimeout ? 'APPS_SCRIPT_TIMEOUT' : 'APPS_SCRIPT_NETWORK_ERROR',
+      error: isTimeout
+        ? 'Timed out waiting for Google Apps Script webhook response (18s).'
+        : err?.message || 'Failed to reach Apps Script webhook URL',
+    };
+  }
+}
+
+/**
+ * Orchestrates the 6-stage welcome-email lifecycle for a verified Firebase user.
+ * Safely handles first-time signups, pending/failed queue retries, and strict idempotency.
+ */
+async function syncWorkspaceAndOrchestrateWelcomeEmail(params: {
+  verifiedUser: VerifiedFirebaseToken;
+  fullName: string;
+  storeName: string | null;
+  isSignup: boolean;
+  ensureWelcomeEmail: boolean;
+  endpointName: string;
+}) {
+  const { verifiedUser, fullName, storeName, isSignup, ensureWelcomeEmail, endpointName } = params;
+  const cfg = getServerSupabaseConfig();
+  const idempotencyKey = `welcome:firebase_uid:${verifiedUser.uid}`;
+
+  const trace: WelcomeEmailDiagnosticTrace = {
+    traceId: `TRC-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: new Date().toISOString(),
+    firebaseUid: verifiedUser.uid,
+    maskedEmail: maskEmailForLogs(verifiedUser.email),
+    idempotencyKey,
+    stages: {
+      stage1_signup_completed: {
+        completed: true,
+        isSignupRequest: isSignup,
+        provider: verifiedUser.signInProvider,
+      },
+      stage2_welcome_trigger_invoked: {
+        invoked: true,
+        endpoint: endpointName,
+      },
+      stage3_vercel_endpoint_accepted: {
+        accepted: false,
+        isNewAccount: false,
+        welcomeQueued: false,
+        queueId: null,
+        alreadySent: false,
+      },
+      stage4_apps_script_processed: {
+        attempted: false,
+        accepted: false,
+        errorCode: null,
+        errorMessage: null,
+      },
+      stage5_email_provider_accepted: {
+        dispatched: false,
+        providerStatus: 'NOT_ATTEMPTED',
+      },
+      stage6_final_status_recorded: {
+        recorded: false,
+        finalStatus: 'NOT_NEEDED',
+        errorMessage: null,
+      },
+    },
+  };
+
+  // Step 1: Call canonical workspace sync RPC
+  let { data: syncData, error: rpcError } = await callSupabaseRpcWithFallback(
     'sync_firebase_workspace_and_welcome',
     {
       p_firebase_uid: verifiedUser.uid,
       p_email: verifiedUser.email,
-      p_full_name: verifiedUser.name || verifiedUser.email.split('@')[0] || 'Store Procurement Lead',
-      p_store_name: null,
+      p_full_name: fullName,
+      p_store_name: storeName,
       p_provider: verifiedUser.signInProvider,
       p_avatar_url: verifiedUser.picture || '',
-      p_is_signup: false,
+      p_is_signup: isSignup,
     }
   );
 
-  if (!rpcError && syncData?.organization_id && syncData?.profile_id) {
+  if (rpcError) {
+    const isMissingRpc =
+      rpcError.message?.includes('sync_firebase_workspace_and_welcome') ||
+      rpcError.code === 'PGRST202' ||
+      rpcError.code === '42883';
+
+    trace.stages.stage6_final_status_recorded = {
+      recorded: false,
+      finalStatus: 'FAILED',
+      errorMessage: rpcError.message,
+    };
+    recordDiagnosticTrace(trace);
+
+    return {
+      httpStatus: 200,
+      payload: {
+        success: false,
+        migrationRequired: isMissingRpc,
+        firebaseUid: verifiedUser.uid,
+        email: verifiedUser.email,
+        errorCode: isMissingRpc ? 'SUPABASE_MIGRATION_MISSING' : 'SUPABASE_RPC_ERROR',
+        error: isMissingRpc
+          ? 'Supabase migration 20261025_firebase_identity_and_email_automation.sql has not been applied yet.'
+          : rpcError.message,
+        diagnostics: trace,
+      },
+    };
+  }
+
+  let queueId: string | null = syncData?.queue_id ? String(syncData.queue_id) : null;
+  let welcomeQueued = Boolean(syncData?.welcome_queued && queueId);
+  let alreadySent = false;
+
+  // Step 2: If sync_firebase_workspace_and_welcome did not return a newly queued PENDING row,
+  // inspect the user's existing email_queue & delivery_logs via SECURITY DEFINER RPC to check:
+  //   a) Whether a WELCOME email was ALREADY SENT (enforce strict idempotency), OR
+  //   b) Whether a WELCOME email is stuck in PENDING / FAILED / PROCESSING and needs retry, OR
+  //   c) Whether a signup / onboarding request never had a WELCOME row created yet.
+  if (!welcomeQueued) {
+    const { data: prefsData } = await callSupabaseRpcWithFallback(
+      'get_firebase_user_email_preferences',
+      {
+        p_firebase_uid: verifiedUser.uid,
+        p_email: verifiedUser.email,
+      }
+    );
+
+    const deliveryLogs: any[] = Array.isArray(prefsData?.delivery_logs)
+      ? prefsData.delivery_logs
+      : [];
+    const emailQueue: any[] = Array.isArray(prefsData?.email_queue) ? prefsData.email_queue : [];
+    const cleanEmail = verifiedUser.email.toLowerCase();
+
+    const sentInLogs = deliveryLogs.some(
+      (l) =>
+        l.template_type === 'WELCOME' &&
+        l.status === 'SENT' &&
+        String(l.recipient_email || '').toLowerCase() === cleanEmail
+    );
+    const sentInQueue = emailQueue.some(
+      (q) =>
+        q.template_type === 'WELCOME' &&
+        q.status === 'SENT' &&
+        (String(q.recipient_email || '').toLowerCase() === cleanEmail ||
+          q.idempotency_key === idempotencyKey)
+    );
+
+    alreadySent = sentInLogs || sentInQueue;
+
+    if (!alreadySent) {
+      // Check for an existing unsent WELCOME row in email_queue (PENDING, FAILED, or stuck PROCESSING)
+      const unsentWelcomeRow = emailQueue.find(
+        (q) =>
+          q.template_type === 'WELCOME' &&
+          ['PENDING', 'FAILED', 'PROCESSING'].includes(String(q.status || '').toUpperCase()) &&
+          (String(q.recipient_email || '').toLowerCase() === cleanEmail ||
+            q.idempotency_key === idempotencyKey)
+      );
+
+      if (unsentWelcomeRow?.id) {
+        queueId = String(unsentWelcomeRow.id);
+        welcomeQueued = true;
+      } else if (isSignup || ensureWelcomeEmail || syncData?.is_new_account) {
+        // No WELCOME row exists at all yet and user has never been sent a welcome email:
+        // force p_is_signup: true to enqueue the idempotent row now.
+        const retrySync = await callSupabaseRpcWithFallback(
+          'sync_firebase_workspace_and_welcome',
+          {
+            p_firebase_uid: verifiedUser.uid,
+            p_email: verifiedUser.email,
+            p_full_name: fullName,
+            p_store_name: storeName,
+            p_provider: verifiedUser.signInProvider,
+            p_avatar_url: verifiedUser.picture || '',
+            p_is_signup: true,
+          }
+        );
+        if (!retrySync.error && retrySync.data?.queue_id) {
+          syncData = retrySync.data;
+          queueId = String(retrySync.data.queue_id);
+          welcomeQueued = true;
+        } else if (isSignup || ensureWelcomeEmail) {
+          // Even if queue_id wasn't returned, allow direct webhook dispatch with idempotencyKey
+          welcomeQueued = true;
+        }
+      }
+    }
+  }
+
+  trace.stages.stage3_vercel_endpoint_accepted = {
+    accepted: true,
+    isNewAccount: Boolean(syncData?.is_new_account),
+    welcomeQueued,
+    queueId,
+    alreadySent,
+  };
+
+  let webhookDispatch: WebhookDispatchResult | null = null;
+
+  if (alreadySent) {
+    trace.stages.stage6_final_status_recorded = {
+      recorded: true,
+      finalStatus: 'SKIPPED',
+    };
+  } else if (welcomeQueued) {
+    trace.stages.stage4_apps_script_processed.attempted = true;
+
+    webhookDispatch = await triggerAppsScriptWebhook({
+      action: 'SEND_WELCOME_EMAIL',
+      queueId,
+      firebaseUid: verifiedUser.uid,
+      email: verifiedUser.email,
+      fullName,
+      organizationId: syncData?.organization_id,
+      storeName: storeName || syncData?.organization_name || 'Your Retail Workspace',
+      idempotencyKey: syncData?.idempotency_key || idempotencyKey,
+      appUrl: cfg.appUrl || undefined,
+    });
+
+    trace.stages.stage4_apps_script_processed = {
+      attempted: webhookDispatch.triggered,
+      accepted: webhookDispatch.dispatched || webhookDispatch.status === 'SKIPPED',
+      httpStatus: webhookDispatch.httpStatus,
+      errorCode: webhookDispatch.errorCode || null,
+      errorMessage: webhookDispatch.error || null,
+    };
+
+    trace.stages.stage5_email_provider_accepted = {
+      dispatched: webhookDispatch.dispatched,
+      providerStatus: webhookDispatch.status,
+    };
+
+    // Stage 6: Ensure final status is recorded in Supabase ONLY when delivery actually succeeded (or failed)
+    if (webhookDispatch.status === 'SENT' && queueId) {
+      await callSupabaseRpcWithFallback('record_email_dispatch_result', {
+        p_queue_id: queueId,
+        p_status: 'SENT',
+        p_error_message: null,
+        p_metadata: {
+          store_name: storeName || syncData?.organization_name || 'Your Retail Workspace',
+          dispatched_via: 'vercel_apps_script_webhook',
+        },
+      });
+      trace.stages.stage6_final_status_recorded = {
+        recorded: true,
+        finalStatus: 'SENT',
+      };
+    } else if (webhookDispatch.status === 'SKIPPED') {
+      trace.stages.stage6_final_status_recorded = {
+        recorded: true,
+        finalStatus: 'SKIPPED',
+      };
+    } else if (webhookDispatch.status === 'QUEUED_FOR_APPS_SCRIPT_POLLER') {
+      // Do NOT mark as SENT when webhook env vars are missing; keep as PENDING in email_queue
+      trace.stages.stage6_final_status_recorded = {
+        recorded: true,
+        finalStatus: 'PENDING',
+        errorMessage: webhookDispatch.error || null,
+      };
+    } else {
+      // Webhook failed — record FAILED status in email_queue so it is visible in diagnostics and can be retried
+      if (queueId) {
+        await callSupabaseRpcWithFallback('record_email_dispatch_result', {
+          p_queue_id: queueId,
+          p_status: 'FAILED',
+          p_error_message: webhookDispatch.error || 'Apps Script webhook dispatch failed',
+          p_metadata: {
+            error_code: webhookDispatch.errorCode || 'WEBHOOK_FAILED',
+          },
+        });
+      }
+      trace.stages.stage6_final_status_recorded = {
+        recorded: true,
+        finalStatus: 'FAILED',
+        errorMessage: webhookDispatch.error || null,
+      };
+    }
+  } else {
+    trace.stages.stage6_final_status_recorded = {
+      recorded: true,
+      finalStatus: 'NOT_NEEDED',
+    };
+  }
+
+  recordDiagnosticTrace(trace);
+
+  return {
+    httpStatus: 200,
+    payload: {
+      success: true,
+      workspace: syncData,
+      welcomeEmail: {
+        queued: welcomeQueued,
+        alreadySent,
+        queueId,
+        idempotencyKey: syncData?.idempotency_key || idempotencyKey,
+        webhookDispatch,
+      },
+      diagnostics: trace,
+    },
+  };
+}
+
+async function resolveVerifiedOrganization(
+  supabase: SupabaseClient,
+  verifiedUser: VerifiedFirebaseToken
+): Promise<{ organizationId: string; profileId: string }> {
+  // 1. First attempt read-only lookup via get_firebase_user_email_preferences so we don't
+  // prematurely consume a new user's welcome_queued flag before /api/auth/sync-workspace runs.
+  const { data: prefLookup } = await callSupabaseRpcWithFallback(
+    'get_firebase_user_email_preferences',
+    {
+      p_firebase_uid: verifiedUser.uid,
+      p_email: verifiedUser.email,
+    }
+  );
+
+  if (prefLookup?.found && prefLookup?.organization_id && prefLookup?.profile_id) {
+    return {
+      organizationId: String(prefLookup.organization_id),
+      profileId: String(prefLookup.profile_id),
+    };
+  }
+
+  // 2. Otherwise run canonical workspace sync AND orchestrate welcome email if newly queued
+  const syncResult = await syncWorkspaceAndOrchestrateWelcomeEmail({
+    verifiedUser,
+    fullName: verifiedUser.name || verifiedUser.email.split('@')[0] || 'Store Procurement Lead',
+    storeName: null,
+    isSignup: false,
+    ensureWelcomeEmail: false,
+    endpointName: 'resolveVerifiedOrganization',
+  });
+
+  const syncData = syncResult.payload.workspace;
+  if (syncData?.organization_id && syncData?.profile_id) {
     return {
       organizationId: String(syncData.organization_id),
       profileId: String(syncData.profile_id),
     };
   }
 
-  // Fallback direct lookup when service_role key is active
+  // 3. Fallback direct lookup when service_role key is active
   const { data: profile } = await supabase
     .from('profiles')
     .select('id, organization_id')
@@ -129,92 +827,91 @@ async function resolveVerifiedOrganization(
   }
 
   throw new Error(
-    rpcError?.message ||
+    syncResult.payload.error ||
       'Unable to resolve canonical Supabase organization for authenticated Firebase user. Ensure migration 20261025_firebase_identity_and_email_automation.sql is applied.'
   );
-}
-
-async function triggerAppsScriptWebhook(payload: Record<string, any>): Promise<{
-  triggered: boolean;
-  dispatched: boolean;
-  status?: string;
-  error?: string;
-}> {
-  const cfg = getServerSupabaseConfig();
-  if (!cfg.hasAppsScriptWebhook) {
-    return {
-      triggered: false,
-      dispatched: false,
-      status: 'QUEUED_FOR_APPS_SCRIPT_POLLER',
-    };
-  }
-
-  try {
-    const res = await fetch(cfg.appsScriptUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        ...payload,
-        secret: cfg.appsScriptSecret,
-      }),
-      redirect: 'follow',
-    });
-
-    const text = await res.text();
-    let parsed: any = null;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      parsed = { raw: text };
-    }
-
-    if (!res.ok || parsed?.success === false) {
-      return {
-        triggered: true,
-        dispatched: false,
-        status: 'FAILED',
-        error: parsed?.error || `Apps Script webhook HTTP ${res.status}`,
-      };
-    }
-
-    return {
-      triggered: true,
-      dispatched: true,
-      status: parsed?.status || 'SENT',
-    };
-  } catch (err: any) {
-    return {
-      triggered: true,
-      dispatched: false,
-      status: 'FAILED',
-      error: err?.message || 'Failed to reach Apps Script webhook URL',
-    };
-  }
 }
 
 export const app = express();
 app.use(express.json({ limit: '1mb' }));
 
+// Normalize Vercel Serverless rewrite URLs (/api/index?__path=...) so Express routes always match
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  const queryPath = typeof req.query?.__path === 'string' ? req.query.__path : '';
+  if (queryPath && (req.path === '/api/index' || req.path === '/index')) {
+    const cleanSubpath = queryPath.replace(/^\/+/, '');
+    const searchParams = new URLSearchParams(req.url.includes('?') ? req.url.split('?')[1] : '');
+    searchParams.delete('__path');
+    const qs = searchParams.toString();
+    req.url = `/api/${cleanSubpath}${qs ? `?${qs}` : ''}`;
+  } else if (req.path === '/api/index') {
+    const matchedPath = req.headers['x-matched-path'];
+    const forwardedUri = req.headers['x-forwarded-uri'];
+    if (typeof forwardedUri === 'string' && forwardedUri.startsWith('/api/')) {
+      req.url = forwardedUri;
+    } else if (
+      typeof matchedPath === 'string' &&
+      matchedPath.startsWith('/api/') &&
+      matchedPath !== '/api/index'
+    ) {
+      req.url = matchedPath;
+    }
+  }
+  next();
+});
+
 // ====================================================================
 // 1. Health & Email Automation Configuration Status Endpoint
 // ====================================================================
-app.get('/api/email/status', async (_req: Request, res: Response) => {
+let cachedAppsScriptHealth: {
+  checkedAt: number;
+  reachable: boolean;
+  authValid: boolean;
+  remainingDailyQuota: number | null;
+  errorCode: string | null;
+  error: string | null;
+} | null = null;
+
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.json({
+    ok: true,
+    service: 'ReStockIQ API',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('/api/email/status', async (req: Request, res: Response) => {
   const cfg = getServerSupabaseConfig();
-  const supabase = getServerSupabase();
   let rpcMigrationReady = false;
 
-  if (supabase) {
-    try {
-      const { error } = await supabase.rpc('get_firebase_user_email_preferences', {
-        p_firebase_uid: '__health_check__',
-        p_email: '__health_check__@restockiq.local',
-      });
-      rpcMigrationReady = !error;
-    } catch {
-      rpcMigrationReady = false;
-    }
+  try {
+    const { error } = await callSupabaseRpcWithFallback('get_firebase_user_email_preferences', {
+      p_firebase_uid: '__health_check__',
+      p_email: '__health_check__@restockiq.local',
+    });
+    rpcMigrationReady = !error;
+  } catch {
+    rpcMigrationReady = false;
+  }
+
+  let appsScriptProbe = cachedAppsScriptHealth;
+  const forceProbe = req.query.probe === '1' || req.query.probe === 'true';
+  const now = Date.now();
+
+  if (cfg.hasAppsScriptWebhook && (forceProbe || !appsScriptProbe || now - appsScriptProbe.checkedAt > 30000)) {
+    const probeRes = await triggerAppsScriptWebhook({
+      action: 'HEALTH_CHECK',
+    });
+    appsScriptProbe = {
+      checkedAt: now,
+      reachable: probeRes.triggered && probeRes.errorCode !== 'APPS_SCRIPT_NETWORK_ERROR',
+      authValid: probeRes.dispatched && probeRes.errorCode !== 'APPS_SCRIPT_SECRET_MISMATCH',
+      remainingDailyQuota:
+        typeof probeRes.remainingDailyQuota === 'number' ? probeRes.remainingDailyQuota : null,
+      errorCode: probeRes.errorCode || null,
+      error: probeRes.error || null,
+    };
+    cachedAppsScriptHealth = appsScriptProbe;
   }
 
   res.json({
@@ -223,17 +920,46 @@ app.get('/api/email/status', async (_req: Request, res: Response) => {
     firebaseProjectId: 'stockpilotai-2dcae',
     supabaseConfigured: Boolean(cfg.supabaseUrl && cfg.activeSupabaseKey),
     supabaseServiceRoleConfigured: cfg.hasServiceRoleKey,
+    supabasePublishableKeyConfigured: cfg.hasPublishableKey,
     supabaseMigration20261025Applied: rpcMigrationReady,
     appsScriptWebhookConfigured: cfg.hasAppsScriptWebhook,
+    appsScriptUrlFormatValid: cfg.appsScriptUrl ? cfg.isAppsScriptUrlValidFormat : false,
+    configured: {
+      supabaseUrl: Boolean(cfg.supabaseUrl),
+      supabaseSecretKey: cfg.hasServiceRoleKey,
+      supabaseFallbackAnonKey: cfg.hasPublishableKey,
+      appsScriptWebhookUrl: Boolean(cfg.appsScriptUrl),
+      appsScriptWebhookSecret: Boolean(cfg.appsScriptSecret),
+      appUrl: cfg.appUrl,
+    },
+    schedule: {
+      dailyInventoryAlertTime: '10:00 AM Asia/Kolkata (IST)',
+      welcomeEmailMode: cfg.hasAppsScriptWebhook
+        ? 'INSTANT_WEBHOOK_AND_QUEUE_POLLER'
+        : 'SUPABASE_EMAIL_QUEUE_POLLER_ONLY',
+    },
+    appsScriptProbe: appsScriptProbe || {
+      checkedAt: null,
+      reachable: false,
+      authValid: false,
+      remainingDailyQuota: null,
+      errorCode: cfg.hasAppsScriptWebhook ? null : 'MISSING_APPS_SCRIPT_ENV',
+      error: cfg.hasAppsScriptWebhook
+        ? null
+        : 'Configure STOCKPILOT_APPS_SCRIPT_URL and STOCKPILOT_APPS_SCRIPT_SECRET in Vercel Production Environment Variables.',
+    },
+    environmentVariables: cfg.explicitVariablesStatus,
+    missingProductionEnvVars: cfg.missingProductionEnvVars,
     deliveryMode: cfg.hasAppsScriptWebhook
       ? 'INSTANT_WEBHOOK_AND_QUEUE_POLLER'
-      : 'SUPABASE_EMAIL_QUEUE_POLLER',
+      : 'SUPABASE_EMAIL_QUEUE_POLLER_ONLY',
     dailyAlertSchedule: '10:00 AM Asia/Kolkata (IST)',
+    recentDiagnostics: RECENT_DIAGNOSTIC_TRACES.slice(0, 10),
   });
 });
 
 // ====================================================================
-// 2. Sync Verified Firebase User Workspace & Enqueue Welcome Email
+// 2. Sync Verified Firebase User Workspace & Enqueue/Send Welcome Email
 // ====================================================================
 app.post('/api/auth/sync-workspace', async (req: Request, res: Response) => {
   try {
@@ -243,6 +969,7 @@ app.post('/api/auth/sync-workspace', async (req: Request, res: Response) => {
     if (!supabase) {
       return res.status(503).json({
         success: false,
+        errorCode: 'SUPABASE_NOT_CONFIGURED',
         error: 'Supabase is not configured on the server.',
       });
     }
@@ -253,64 +980,63 @@ app.post('/api/auth/sync-workspace', async (req: Request, res: Response) => {
     ).trim();
     const storeName = body.storeName ? String(body.storeName).trim() : null;
     const isSignup = Boolean(body.isSignup);
+    const ensureWelcomeEmail = Boolean(body.ensureWelcomeEmail);
 
-    const { data: syncData, error: rpcError } = await supabase.rpc(
-      'sync_firebase_workspace_and_welcome',
-      {
-        p_firebase_uid: verifiedUser.uid,
-        p_email: verifiedUser.email,
-        p_full_name: fullName,
-        p_store_name: storeName,
-        p_provider: verifiedUser.signInProvider,
-        p_avatar_url: verifiedUser.picture || '',
-        p_is_signup: isSignup,
-      }
-    );
-
-    if (rpcError) {
-      const isMissingRpc =
-        rpcError.message?.includes('sync_firebase_workspace_and_welcome') ||
-        rpcError.code === 'PGRST202' ||
-        rpcError.code === '42883';
-
-      return res.status(200).json({
-        success: false,
-        migrationRequired: isMissingRpc,
-        firebaseUid: verifiedUser.uid,
-        email: verifiedUser.email,
-        error: isMissingRpc
-          ? 'Supabase migration 20261025_firebase_identity_and_email_automation.sql has not been applied yet.'
-          : rpcError.message,
-      });
-    }
-
-    let webhookDispatch = null;
-    if (syncData?.welcome_queued && syncData?.queue_id) {
-      webhookDispatch = await triggerAppsScriptWebhook({
-        action: 'SEND_WELCOME_EMAIL',
-        queueId: syncData.queue_id,
-        firebaseUid: verifiedUser.uid,
-        email: verifiedUser.email,
-        fullName,
-        organizationId: syncData.organization_id,
-        storeName: syncData.organization_name,
-        idempotencyKey: syncData.idempotency_key,
-      });
-    }
-
-    return res.json({
-      success: true,
-      workspace: syncData,
-      welcomeEmail: {
-        queued: Boolean(syncData?.welcome_queued),
-        queueId: syncData?.queue_id || null,
-        idempotencyKey: syncData?.idempotency_key || null,
-        webhookDispatch,
-      },
+    const result = await syncWorkspaceAndOrchestrateWelcomeEmail({
+      verifiedUser,
+      fullName,
+      storeName,
+      isSignup,
+      ensureWelcomeEmail,
+      endpointName: '/api/auth/sync-workspace',
     });
+
+    return res.status(result.httpStatus).json(result.payload);
   } catch (err: any) {
     return res.status(401).json({
       success: false,
+      errorCode: 'UNAUTHORIZED_FIREBASE_TOKEN',
+      error: err?.message || 'Unauthorized request',
+    });
+  }
+});
+
+// ====================================================================
+// 2B. Explicit Retry / Verification Endpoint for Pending/Failed Welcome Email
+// ====================================================================
+app.post('/api/email/welcome/retry', async (req: Request, res: Response) => {
+  try {
+    const verifiedUser = await authenticateRequest(req);
+    const supabase = getServerSupabase();
+
+    if (!supabase) {
+      return res.status(503).json({
+        success: false,
+        errorCode: 'SUPABASE_NOT_CONFIGURED',
+        error: 'Supabase is not configured on the server.',
+      });
+    }
+
+    const body = req.body || {};
+    const fullName = String(
+      body.fullName || verifiedUser.name || verifiedUser.email.split('@')[0] || 'Store Procurement Lead'
+    ).trim();
+    const storeName = body.storeName ? String(body.storeName).trim() : null;
+
+    const result = await syncWorkspaceAndOrchestrateWelcomeEmail({
+      verifiedUser,
+      fullName,
+      storeName,
+      isSignup: false,
+      ensureWelcomeEmail: true,
+      endpointName: '/api/email/welcome/retry',
+    });
+
+    return res.status(result.httpStatus).json(result.payload);
+  } catch (err: any) {
+    return res.status(401).json({
+      success: false,
+      errorCode: 'UNAUTHORIZED_FIREBASE_TOKEN',
       error: err?.message || 'Unauthorized request',
     });
   }
@@ -331,10 +1057,13 @@ app.get('/api/preferences/email', async (req: Request, res: Response) => {
       });
     }
 
-    const { data, error } = await supabase.rpc('get_firebase_user_email_preferences', {
-      p_firebase_uid: verifiedUser.uid,
-      p_email: verifiedUser.email,
-    });
+    const { data, error } = await callSupabaseRpcWithFallback(
+      'get_firebase_user_email_preferences',
+      {
+        p_firebase_uid: verifiedUser.uid,
+        p_email: verifiedUser.email,
+      }
+    );
 
     if (error) {
       const isMissingRpc =
@@ -380,7 +1109,7 @@ app.put('/api/preferences/email', async (req: Request, res: Response) => {
     const body = req.body || {};
 
     // Ensure workspace profile exists first
-    await supabase.rpc('sync_firebase_workspace_and_welcome', {
+    await callSupabaseRpcWithFallback('sync_firebase_workspace_and_welcome', {
       p_firebase_uid: verifiedUser.uid,
       p_email: verifiedUser.email,
       p_full_name: verifiedUser.name || verifiedUser.email.split('@')[0],
@@ -390,16 +1119,19 @@ app.put('/api/preferences/email', async (req: Request, res: Response) => {
       p_is_signup: false,
     });
 
-    const { data, error } = await supabase.rpc('update_firebase_user_email_preferences', {
-      p_firebase_uid: verifiedUser.uid,
-      p_email: verifiedUser.email,
-      p_stockout_alerts: Boolean(body.stockout_alerts ?? true),
-      p_price_change_alerts: Boolean(body.price_change_alerts ?? true),
-      p_pending_approval_digest: Boolean(body.pending_approval_digest ?? true),
-      p_daily_inventory_alerts: Boolean(body.daily_inventory_alerts ?? true),
-      p_weekly_briefing: Boolean(body.weekly_briefing ?? true),
-      p_frequency: String(body.frequency || 'INSTANT'),
-    });
+    const { data, error } = await callSupabaseRpcWithFallback(
+      'update_firebase_user_email_preferences',
+      {
+        p_firebase_uid: verifiedUser.uid,
+        p_email: verifiedUser.email,
+        p_stockout_alerts: Boolean(body.stockout_alerts ?? true),
+        p_price_change_alerts: Boolean(body.price_change_alerts ?? true),
+        p_pending_approval_digest: Boolean(body.pending_approval_digest ?? true),
+        p_daily_inventory_alerts: Boolean(body.daily_inventory_alerts ?? true),
+        p_weekly_briefing: Boolean(body.weekly_briefing ?? true),
+        p_frequency: String(body.frequency || 'INSTANT'),
+      }
+    );
 
     if (error) {
       return res.status(400).json({
@@ -432,10 +1164,13 @@ app.get('/api/workspace/snapshot', async (req: Request, res: Response) => {
     }
 
     // Try dedicated snapshot RPC first
-    const { data: rpcSnapshot, error: rpcErr } = await supabase.rpc('get_firebase_workspace_snapshot', {
-      p_firebase_uid: verifiedUser.uid,
-      p_email: verifiedUser.email,
-    });
+    const { data: rpcSnapshot, error: rpcErr } = await callSupabaseRpcWithFallback(
+      'get_firebase_workspace_snapshot',
+      {
+        p_firebase_uid: verifiedUser.uid,
+        p_email: verifiedUser.email,
+      }
+    );
 
     if (!rpcErr && rpcSnapshot?.found) {
       return res.json({
@@ -754,7 +1489,8 @@ async function startStandaloneServer() {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   } else {
-    const { createServer: createViteServer } = await import('vite');
+    const viteModuleId = 'vite';
+    const { createServer: createViteServer } = await import(/* @vite-ignore */ viteModuleId);
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -767,8 +1503,12 @@ async function startStandaloneServer() {
   });
 }
 
-const isVercelServerless = Boolean(process.env.VERCEL === '1' || process.env.VERCEL_ENV);
-if (!isVercelServerless && process.env.NODE_ENV !== 'test') {
+const isVercelServerless = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+const isDirectExecution = Boolean(
+  process.argv[1] &&
+    (process.argv[1].endsWith('server.ts') || process.argv[1].endsWith('server.js'))
+);
+if (!isVercelServerless && isDirectExecution && process.env.NODE_ENV !== 'test') {
   startStandaloneServer().catch((err) => {
     console.error('Failed to start ReStockIQ server:', err);
     process.exit(1);

@@ -3,29 +3,57 @@ import { getBackendConfig } from './config';
 import { InventoryItem, Supplier, IncomingOrder, ReorderRequest, AuditEvent, User } from '../types';
 import { auth } from '../lib/firebase';
 
+export type SupabaseConnectionStatus =
+  | 'checking'
+  | 'connected'
+  | 'config_error'
+  | 'connection_failed'
+  | 'unconfigured';
+
+export interface SupabaseHealthCheckResult {
+  status: SupabaseConnectionStatus;
+  isConnected: boolean;
+  migrationRequired: boolean;
+  error: string | null;
+  verifiedAt: string;
+}
+
 let supabaseInstance: SupabaseClient | null = null;
+let initializedUrl: string | null = null;
+let initializedKey: string | null = null;
 
 export function getSupabase(): SupabaseClient | null {
-  if (supabaseInstance) return supabaseInstance;
-
   const config = getBackendConfig();
-  if (config.isSupabaseConfigured && config.supabaseUrl && config.supabaseAnonKey) {
-    try {
-      supabaseInstance = createClient(config.supabaseUrl, config.supabaseAnonKey, {
-        auth: {
-          persistSession: true,
-          autoRefreshToken: true,
-          detectSessionInUrl: true,
-        },
-      });
-      return supabaseInstance;
-    } catch (err) {
-      console.error('Failed to initialize Supabase client:', err);
-      return null;
-    }
+  if (!config.isSupabaseConfigured || !config.supabaseUrl || !config.supabaseAnonKey) {
+    supabaseInstance = null;
+    initializedUrl = null;
+    initializedKey = null;
+    return null;
   }
 
-  return null;
+  if (
+    supabaseInstance &&
+    initializedUrl === config.supabaseUrl &&
+    initializedKey === config.supabaseAnonKey
+  ) {
+    return supabaseInstance;
+  }
+
+  try {
+    supabaseInstance = createClient(config.supabaseUrl, config.supabaseAnonKey, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true,
+      },
+    });
+    initializedUrl = config.supabaseUrl;
+    initializedKey = config.supabaseAnonKey;
+    return supabaseInstance;
+  } catch (err) {
+    console.error('Failed to initialize Supabase client:', err);
+    return null;
+  }
 }
 
 export function isSupabaseReady(): boolean {
@@ -35,6 +63,175 @@ export function isSupabaseReady(): boolean {
 export function getSupabaseConfigError(): string | null {
   const config = getBackendConfig();
   return config.configError;
+}
+
+export function classifySupabaseError(error: any): {
+  isInvalidApiKey: boolean;
+  isMissingTable: boolean;
+  isRlsPolicy: boolean;
+  isNetworkError: boolean;
+  rawMessage: string;
+} {
+  const rawMessage = String(error?.message || error?.error_description || error || '').trim();
+  const lower = rawMessage.toLowerCase();
+  const code = String(error?.code || '').toUpperCase();
+
+  const isInvalidApiKey =
+    lower.includes('invalid api key') ||
+    lower.includes('no api key found') ||
+    lower.includes('apikey') ||
+    lower.includes('jws') ||
+    lower.includes('jwt expired') ||
+    lower.includes('invalid jwt') ||
+    lower.includes('malformed') ||
+    code === 'PGRST301';
+
+  const isMissingTable =
+    code === '42P01' ||
+    code === 'PGRST202' ||
+    code === '42883' ||
+    lower.includes('does not exist') ||
+    (lower.includes('relation') && lower.includes('not exist')) ||
+    lower.includes('could not find the table');
+
+  const isRlsPolicy =
+    code === '42501' ||
+    lower.includes('row-level security') ||
+    lower.includes('permission denied');
+
+  const isNetworkError =
+    lower.includes('failed to fetch') ||
+    lower.includes('networkerror') ||
+    lower.includes('network request failed') ||
+    lower.includes('load failed');
+
+  return {
+    isInvalidApiKey,
+    isMissingTable,
+    isRlsPolicy,
+    isNetworkError,
+    rawMessage,
+  };
+}
+
+export async function verifySupabaseConnection(): Promise<SupabaseHealthCheckResult> {
+  const verifiedAt = new Date().toISOString();
+  const config = getBackendConfig();
+
+  if (config.isMisconfigured) {
+    return {
+      status: 'config_error',
+      isConnected: false,
+      migrationRequired: false,
+      error: config.configError || 'Invalid Supabase configuration.',
+      verifiedAt,
+    };
+  }
+
+  if (!config.isSupabaseConfigured || !config.supabaseUrl || !config.supabaseAnonKey) {
+    return {
+      status: 'unconfigured',
+      isConnected: false,
+      migrationRequired: false,
+      error: null,
+      verifiedAt,
+    };
+  }
+
+  const client = getSupabase();
+  if (!client) {
+    return {
+      status: 'config_error',
+      isConnected: false,
+      migrationRequired: false,
+      error: 'Unable to initialize Supabase client.',
+      verifiedAt,
+    };
+  }
+
+  try {
+    const { error } = await client
+      .from('inventory_items')
+      .select('id', { count: 'exact', head: true })
+      .limit(1);
+
+    if (error) {
+      const classified = classifySupabaseError(error);
+      if (classified.isInvalidApiKey) {
+        return {
+          status: 'config_error',
+          isConnected: false,
+          migrationRequired: false,
+          error: `Invalid API key rejected by ${config.supabaseUrl} (${config.activeKeyVar || 'VITE_SUPABASE_ANON_KEY'}). Ensure your public anon or publishable key for project "${config.expectedProjectRef}" is set in Vercel Environment Variables and redeploy.`,
+          verifiedAt,
+        };
+      }
+
+      if (classified.isNetworkError) {
+        return {
+          status: 'connection_failed',
+          isConnected: false,
+          migrationRequired: false,
+          error: `Unable to reach Supabase host (${config.supabaseUrl}). Check network connectivity or CORS settings.`,
+          verifiedAt,
+        };
+      }
+
+      if (classified.isMissingTable) {
+        return {
+          status: 'connected',
+          isConnected: true,
+          migrationRequired: true,
+          error: null,
+          verifiedAt,
+        };
+      }
+
+      if (classified.isRlsPolicy) {
+        return {
+          status: 'connected',
+          isConnected: true,
+          migrationRequired: false,
+          error: null,
+          verifiedAt,
+        };
+      }
+
+      return {
+        status: 'connection_failed',
+        isConnected: false,
+        migrationRequired: false,
+        error: classified.rawMessage || 'Supabase health check returned an unexpected error.',
+        verifiedAt,
+      };
+    }
+
+    return {
+      status: 'connected',
+      isConnected: true,
+      migrationRequired: false,
+      error: null,
+      verifiedAt,
+    };
+  } catch (err: any) {
+    const classified = classifySupabaseError(err);
+    if (classified.isInvalidApiKey) {
+      return {
+        status: 'config_error',
+        isConnected: false,
+        migrationRequired: false,
+        error: `Invalid API key rejected by ${config.supabaseUrl}.`,
+        verifiedAt,
+      };
+    }
+    return {
+      status: 'connection_failed',
+      isConnected: false,
+      migrationRequired: false,
+      error: classified.rawMessage || 'Failed to connect to Supabase.',
+      verifiedAt,
+    };
+  }
 }
 
 export async function hasActiveSupabaseSession(): Promise<boolean> {
@@ -474,20 +671,47 @@ export async function fetchInventoryItems(): Promise<{
       .order('sku', { ascending: true });
 
     if (error) {
-      const isMissingTable = error.code === '42P01' || error.message.includes('relation') || error.message.includes('does not exist');
-      return { 
-        items: [], 
-        isConnected: true, 
-        migrationRequired: isMissingTable,
-        error: isMissingTable 
-          ? `Supabase table "public.inventory_items" does not exist yet. Please run the SQL migrations in the Supabase SQL Editor.` 
-          : error.message 
+      const classified = classifySupabaseError(error);
+      if (classified.isInvalidApiKey) {
+        return {
+          items: [],
+          isConnected: false,
+          error: `Invalid API key rejected by ${config.supabaseUrl} (${config.activeKeyVar || 'VITE_SUPABASE_ANON_KEY'}). Ensure your public anon or publishable key for project "${config.expectedProjectRef}" is set in Vercel Environment Variables and redeploy.`,
+        };
+      }
+      if (classified.isNetworkError) {
+        return {
+          items: [],
+          isConnected: false,
+          error: `Network error connecting to Supabase (${config.supabaseUrl}): ${classified.rawMessage}`,
+        };
+      }
+      if (classified.isMissingTable) {
+        return {
+          items: [],
+          isConnected: true,
+          migrationRequired: true,
+          error: undefined,
+        };
+      }
+      if (classified.isRlsPolicy) {
+        return {
+          items: [],
+          isConnected: true,
+          migrationRequired: false,
+          error: undefined,
+        };
+      }
+      return {
+        items: [],
+        isConnected: false,
+        error: classified.rawMessage || 'Failed to query Supabase inventory_items.',
       };
     }
 
     return { items: (data || []).map(mapInventoryRow), isConnected: true };
   } catch (err: any) {
-    return { items: [], isConnected: false, error: err.message };
+    return { items: [], isConnected: false, error: err?.message || 'Supabase request failed' };
   }
 }
 

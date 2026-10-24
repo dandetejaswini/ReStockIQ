@@ -4,7 +4,6 @@ import { Sparkles, ShieldCheck, ArrowRight, Eye, EyeOff, CheckCircle2, AlertTria
 import { useApp } from '../context/AppContext';
 import { useAuth } from '../context/AuthContext';
 import { sanitizeUserFacingError } from '../lib/firebase';
-import { signUpUser, isSupabaseReady } from '../services/supabaseClient';
 import { getBackendConfig } from '../services/config';
 import { GoogleOnboardingModal } from '../components/onboarding/GoogleOnboardingModal';
 
@@ -72,7 +71,7 @@ export const SignupPage: React.FC = () => {
       return;
     }
 
-    // 1. Firebase Authentication & Firestore User Profile Registration
+    // Firebase Authentication, Firestore Profile, Canonical Supabase Workspace & Welcome Email
     try {
       const fbRes = await signUpWithEmail(
         email.trim(),
@@ -82,30 +81,12 @@ export const SignupPage: React.FC = () => {
       );
 
       if (!fbRes.success) {
-        setError(fbRes.error || 'Failed to create user account with Firebase.');
+        setError(fbRes.error || 'Failed to create user account.');
         setIsLoading(false);
         return;
       }
     } catch (fbErr: any) {
-      console.warn('Firebase signup notification:', fbErr);
-    }
-
-    // 2. Also register in Supabase tenancy schema if Supabase is active
-    if (isSupabaseReady()) {
-      try {
-        const sbRes = await signUpUser(
-          email.trim(),
-          password,
-          fullName.trim() || 'Store Procurement Lead',
-          storeName.trim() || undefined
-        );
-
-        if (!sbRes.sessionConfirmed && sbRes.success) {
-          setConfirmationNotice(`Registration successful! Please check ${email} for confirmation instructions.`);
-        }
-      } catch (sbErr) {
-        console.warn('Supabase dual-sync warning:', sbErr);
-      }
+      console.warn('Signup notification:', fbErr);
     }
 
     loginUser(email.trim(), fullName.trim() || 'Store Procurement Lead', true);

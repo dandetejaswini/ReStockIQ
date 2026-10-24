@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { 
   ChevronDown, 
@@ -25,21 +25,8 @@ export interface OperationsNavItem {
   badge?: number;
 }
 
-export const OperationsDropdown: React.FC<OperationsDropdownProps> = ({
-  pendingApprovalsCount = 0,
-  className = '',
-  onNavigate,
-}) => {
-  const [isOpen, setIsOpen] = useState(false);
-  const [focusedIndex, setFocusedIndex] = useState<number>(-1);
-  const location = useLocation();
-  const navigate = useNavigate();
-
-  const containerRef = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const itemsRef = useRef<(HTMLAnchorElement | null)[]>([]);
-
-  const operationsItems: OperationsNavItem[] = [
+export function getOperationsNavItems(pendingApprovalsCount = 0): OperationsNavItem[] {
+  return [
     {
       id: 'briefing',
       name: 'Daily Briefing',
@@ -91,20 +78,49 @@ export const OperationsDropdown: React.FC<OperationsDropdownProps> = ({
       description: 'Immutable ledger of decisions & calculation traces',
     },
   ];
+}
 
+export const OperationsDropdown: React.FC<OperationsDropdownProps> = ({
+  pendingApprovalsCount = 0,
+  className = '',
+  onNavigate,
+}) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const [focusedIndex, setFocusedIndex] = useState<number>(-1);
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const itemsRef = useRef<(HTMLAnchorElement | null)[]>([]);
+
+  const operationsItems = getOperationsNavItems(pendingApprovalsCount);
   const isOperationsActive = operationsItems.some(item => location.pathname === item.path);
 
-  // Close when clicking outside
+  // Close when clicking or touching outside
   useEffect(() => {
-    const handleOutsideClick = (e: MouseEvent) => {
+    const handleOutsideClick = (e: MouseEvent | TouchEvent) => {
       if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
         setIsOpen(false);
         setFocusedIndex(-1);
       }
     };
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && isOpen) {
+        setIsOpen(false);
+        setFocusedIndex(-1);
+        triggerRef.current?.focus();
+      }
+    };
     document.addEventListener('mousedown', handleOutsideClick);
-    return () => document.removeEventListener('mousedown', handleOutsideClick);
-  }, []);
+    document.addEventListener('touchstart', handleOutsideClick, { passive: true });
+    document.addEventListener('keydown', handleGlobalKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideClick);
+      document.removeEventListener('touchstart', handleOutsideClick);
+      document.removeEventListener('keydown', handleGlobalKeyDown);
+    };
+  }, [isOpen]);
 
   // Close on route change
   useEffect(() => {
@@ -160,13 +176,14 @@ export const OperationsDropdown: React.FC<OperationsDropdownProps> = ({
       <button
         ref={triggerRef}
         type="button"
-        onClick={() => setIsOpen(!isOpen)}
+        onClick={() => setIsOpen(prev => !prev)}
         onKeyDown={handleTriggerKeyDown}
         aria-haspopup="menu"
         aria-expanded={isOpen}
+        aria-controls="desktop-operations-menu"
         aria-label="Operations Menu"
-        className={`flex items-center gap-1.5 px-4 py-1.5 text-[13px] font-medium rounded-full transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-white/70 ${
-          isOperationsActive
+        className={`flex items-center gap-1.5 px-4 py-1.5 text-[13px] font-medium rounded-full transition-all cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-white/70 ${
+          isOperationsActive || isOpen
             ? 'bg-[#E8E2F0] text-[#46362F] font-semibold shadow-xs'
             : 'text-white/85 hover:text-white hover:bg-white/10'
         }`}
@@ -189,24 +206,25 @@ export const OperationsDropdown: React.FC<OperationsDropdownProps> = ({
       {/* Dropdown Surface */}
       {isOpen && (
         <div
+          id="desktop-operations-menu"
           role="menu"
           aria-label="Operations & Governance Submenu"
-          className="absolute left-0 mt-2 w-80 sm:w-88 bg-white text-[#46362F] rounded-2xl shadow-xl border border-[#E7E0D8] overflow-hidden z-50 animate-in fade-in zoom-in-95 duration-100"
+          className="absolute left-0 top-full mt-2 w-80 sm:w-88 max-w-[calc(100vw-2rem)] bg-white text-[#46362F] rounded-2xl shadow-xl border border-[#E7E0D8] overflow-hidden z-[70] animate-in fade-in zoom-in-95 duration-100"
         >
           {/* Header strip */}
-          <div className="px-4 py-2.5 bg-[#F8F6F2] border-b border-[#E7E0D8] flex items-center justify-between">
+          <div className="px-4 py-2.5 bg-[#F8F6F2] border-b border-[#E7E0D8] flex items-center justify-between gap-2">
             <span className="text-[10px] font-bold uppercase tracking-wider text-[#6B625B]">
               Supply Chain Operations & Governance
             </span>
             {pendingApprovalsCount > 0 && (
-              <span className="text-[10px] font-semibold text-[#B42335]">
+              <span className="text-[10px] font-semibold text-[#B42335] shrink-0">
                 {pendingApprovalsCount} Action{pendingApprovalsCount > 1 ? 's' : ''} Required
               </span>
             )}
           </div>
 
           {/* Menu Items */}
-          <div className="p-1.5 space-y-0.5">
+          <div className="p-1.5 space-y-0.5 max-h-[75vh] overflow-y-auto">
             {operationsItems.map((item, idx) => {
               const Icon = item.icon;
               const isActive = location.pathname === item.path;

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { TopNavigation } from './TopNavigation';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { 
@@ -7,7 +7,8 @@ import {
   AlertTriangle,
   Database,
   FileText,
-  ArrowUpRight
+  ArrowUpRight,
+  RefreshCw
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { BRAND_CONFIG } from '../../services/config';
@@ -19,52 +20,87 @@ interface AppLayoutProps {
 export const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
   const location = useLocation();
   const navigate = useNavigate();
-  const { supabaseConfigError, migrationNotice, requests } = useApp();
+  const {
+    supabaseConfigError,
+    supabaseConnectionStatus,
+    recheckSupabaseConnection,
+    migrationNotice,
+    requests
+  } = useApp();
+  const [isRechecking, setIsRechecking] = useState(false);
+
   const isPublicPage = location.pathname === '/' || location.pathname === '/about' || location.pathname === '/contact';
   const isBriefingPage = location.pathname === '/briefing' || location.pathname === '/daily-briefing';
   const isAgentPage = location.pathname === '/agent';
   const pendingCount = requests.filter(r => r.status === 'Pending Approval' || r.status === 'Needs Budget Review').length;
 
+  const handleRecheck = async () => {
+    setIsRechecking(true);
+    try {
+      await recheckSupabaseConnection();
+    } finally {
+      setIsRechecking(false);
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-[#F8F6F2] text-[#46362F] flex flex-col font-['Manrope',sans-serif] relative selection:bg-[#E8E2F0] selection:text-[#46362F]">
+    <div className="min-h-screen w-full max-w-full overflow-x-clip bg-[#F8F6F2] text-[#46362F] flex flex-col font-['Manrope',sans-serif] relative selection:bg-[#E8E2F0] selection:text-[#46362F]">
       {/* Horizontal Deep Espresso Top Navigation */}
       <TopNavigation />
 
-      {/* Explicit Supabase Configuration Error Banner (Shown on operational routes) */}
+      {/* Explicit Supabase Configuration / Connection Error Banner (Shown on operational routes) */}
       {!isPublicPage && supabaseConfigError && (
-        <div className="bg-[#B42335] text-white px-4 py-2.5 text-xs border-b border-[#961b2b] shadow-xs">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 max-w-[1440px] mx-auto w-full">
-            <div className="flex items-center gap-2.5">
-              <AlertTriangle className="w-4 h-4 shrink-0 text-[#F8C8CE]" />
-              <div>
-                <span className="font-bold">Supabase Configuration Error: </span>
+        <div
+          role="alert"
+          className="bg-[#B42335] text-white px-3.5 sm:px-6 py-2.5 text-xs border-b border-[#961b2b] shadow-xs w-full"
+        >
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 max-w-[1440px] mx-auto w-full min-w-0">
+            <div className="flex items-start sm:items-center gap-2.5 min-w-0">
+              <AlertTriangle className="w-4 h-4 shrink-0 text-[#F8C8CE] mt-0.5 sm:mt-0" />
+              <div className="min-w-0 break-words">
+                <span className="font-bold">
+                  {supabaseConnectionStatus === 'connection_failed'
+                    ? 'Supabase Connection Error: '
+                    : 'Supabase Configuration Error: '}
+                </span>
                 <span>{supabaseConfigError}</span>
               </div>
             </div>
-            <Link 
-              to="/settings" 
-              className="px-2.5 py-1 bg-white text-[#B42335] font-semibold rounded text-[11px] whitespace-nowrap hover:bg-[#F8F6F2] transition-colors self-start sm:self-auto"
-            >
-              Review Configuration
-            </Link>
+            <div className="flex flex-wrap items-center gap-2 shrink-0 self-start sm:self-auto">
+              <button
+                type="button"
+                onClick={handleRecheck}
+                disabled={isRechecking}
+                className="inline-flex items-center gap-1 px-2.5 py-1 bg-white/15 hover:bg-white/25 text-white font-semibold rounded text-[11px] whitespace-nowrap transition-colors disabled:opacity-50 cursor-pointer"
+              >
+                <RefreshCw className={`w-3 h-3 ${isRechecking ? 'animate-spin' : ''}`} />
+                <span>{isRechecking ? 'Checking…' : 'Retry Connection'}</span>
+              </button>
+              <Link 
+                to="/settings?tab=supabase" 
+                className="px-2.5 py-1 bg-white text-[#B42335] font-semibold rounded text-[11px] whitespace-nowrap hover:bg-[#F8F6F2] transition-colors"
+              >
+                Review Configuration
+              </Link>
+            </div>
           </div>
         </div>
       )}
 
       {/* Migration Notice Banner (Shown on operational routes when tables are missing) */}
       {!isPublicPage && migrationNotice && !supabaseConfigError && (
-        <div className="bg-[#46362F] text-[#F8F6F2] border-b border-[#D9C6A5]/30 px-4 py-2.5 text-xs shadow-xs">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 max-w-[1440px] mx-auto w-full">
-            <div className="flex items-center gap-2.5">
-              <Database className="w-4 h-4 text-[#D9C6A5] shrink-0" />
-              <div>
+        <div className="bg-[#46362F] text-[#F8F6F2] border-b border-[#D9C6A5]/30 px-3.5 sm:px-6 py-2.5 text-xs shadow-xs w-full">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 max-w-[1440px] mx-auto w-full min-w-0">
+            <div className="flex items-start sm:items-center gap-2.5 min-w-0">
+              <Database className="w-4 h-4 text-[#D9C6A5] shrink-0 mt-0.5 sm:mt-0" />
+              <div className="min-w-0 break-words">
                 <span className="font-bold">Database Setup Notice: </span>
                 <span>PostgreSQL database tables not detected. Please run the SQL migrations in the Supabase SQL Editor to activate live storage.</span>
               </div>
             </div>
             <Link 
-              to="/settings" 
-              className="px-2.5 py-1 bg-[#D9C6A5] text-[#46362F] font-semibold rounded text-[11px] whitespace-nowrap hover:bg-[#c9b48f] transition-colors self-start sm:self-auto"
+              to="/settings?tab=supabase" 
+              className="px-2.5 py-1 bg-[#D9C6A5] text-[#46362F] font-semibold rounded text-[11px] whitespace-nowrap hover:bg-[#c9b48f] transition-colors self-start sm:self-auto shrink-0"
             >
               View SQL Migrations
             </Link>
@@ -73,13 +109,13 @@ export const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
       )}
 
       {/* Main Content Area */}
-      <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 py-6 sm:py-8">
+      <main className="flex-1 max-w-[1440px] w-full min-w-0 mx-auto px-3.5 sm:px-6 py-5 sm:py-8">
         {children}
       </main>
 
       {/* Editorial Multi-Column Enterprise Footer */}
-      <footer className="border-t border-[#E7E0D8] bg-[#F8F6F2] pt-12 pb-8 text-xs text-[#6B625B]">
-        <div className="max-w-[1440px] mx-auto px-4 sm:px-6">
+      <footer className="border-t border-[#E7E0D8] bg-[#F8F6F2] pt-10 sm:pt-12 pb-8 text-xs text-[#6B625B] w-full">
+        <div className="max-w-[1440px] mx-auto px-3.5 sm:px-6">
           <div className="grid grid-cols-1 md:grid-cols-12 gap-8 pb-10 border-b border-[#E7E0D8]">
             
             {/* Column 1: Brand & Platform Identity (5 cols) */}
@@ -221,7 +257,7 @@ export const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
       {/* Persistent Floating Daily Briefing Quick Action (Hidden on Briefing page & Copilot chat page to prevent any overlap) */}
       {!isBriefingPage && !isAgentPage && (
         <div
-          className="fixed bottom-5 right-5 z-40 pointer-events-none"
+          className="fixed bottom-4 right-3.5 sm:bottom-5 sm:right-5 z-40 pointer-events-none max-w-[calc(100vw-1.75rem)]"
           style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
         >
           <button
@@ -229,10 +265,10 @@ export const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
             onClick={() => navigate('/briefing')}
             aria-label="Open In-App Daily Briefing"
             title="Open In-App Daily Briefing"
-            className="pointer-events-auto quick-action-3d group flex items-center gap-2 px-4 py-2.5 rounded-full bg-[#46362F] hover:bg-[#324536] text-white text-xs font-semibold shadow-lg border border-[#D9C6A5]/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#D9C6A5] focus-visible:ring-offset-2"
+            className="pointer-events-auto quick-action-3d group flex items-center gap-1.5 sm:gap-2 px-3 py-2 sm:px-4 sm:py-2.5 rounded-full bg-[#46362F] hover:bg-[#324536] text-white text-xs font-semibold shadow-lg border border-[#D9C6A5]/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#D9C6A5] focus-visible:ring-offset-2"
           >
-            <span className="w-6 h-6 rounded-full bg-[#324536] group-hover:bg-[#46362F] text-[#BCE8D3] flex items-center justify-center border border-[#8A9A83]/40 transition-colors">
-              <FileText className="w-3.5 h-3.5" aria-hidden="true" />
+            <span className="w-5 h-5 sm:w-6 sm:h-6 rounded-full bg-[#324536] group-hover:bg-[#46362F] text-[#BCE8D3] flex items-center justify-center border border-[#8A9A83]/40 transition-colors shrink-0">
+              <FileText className="w-3 h-3 sm:w-3.5 sm:h-3.5" aria-hidden="true" />
             </span>
             <span className="whitespace-nowrap">Daily Briefing</span>
             {pendingCount > 0 && (
@@ -240,7 +276,7 @@ export const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
                 {pendingCount}
               </span>
             )}
-            <ArrowUpRight className="w-3.5 h-3.5 text-[#D9C6A5] group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" aria-hidden="true" />
+            <ArrowUpRight className="w-3.5 h-3.5 text-[#D9C6A5] group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform shrink-0" aria-hidden="true" />
           </button>
         </div>
       )}

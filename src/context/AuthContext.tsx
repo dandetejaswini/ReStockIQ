@@ -149,11 +149,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         user.email?.split('@')[0] ||
         'Store Procurement Lead';
 
-      // Sync canonical Supabase workspace & welcome email in parallel/sequence
+      // Sync canonical Supabase workspace & welcome email
       const wsRes = await syncFirebaseWorkspaceAndWelcomeEmail(user, {
         fullName: candidateFullName,
         storeName: candidateStoreName,
         isSignup: isNewAccount,
+        ensureWelcomeEmail: isNewAccount,
         force: options?.force,
       });
 
@@ -210,10 +211,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      setFirebaseUser(currentUser);
       if (currentUser) {
         // If an explicit login/signup method is actively handling initialization, wait for it
         if (isExplicitAuthFlowRef.current) {
+          setFirebaseUser(currentUser);
           return;
         }
         try {
@@ -223,7 +224,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const fallback = buildFallbackUserProfile(currentUser);
           setUserProfile(fallback);
         }
+        setFirebaseUser(currentUser);
       } else {
+        setFirebaseUser(null);
         setUserProfile(null);
         setWorkspaceError(null);
       }
@@ -287,7 +290,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       const result = await signInWithPopup(auth, googleProvider);
       const user = result.user;
-      setFirebaseUser(user);
 
       const additionalInfo = getAdditionalUserInfo(result);
       const isNewGoogleUser = Boolean(additionalInfo?.isNewUser);
@@ -297,6 +299,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         force: true,
       });
 
+      setFirebaseUser(user);
       setUserProfile(profile);
       setIsLoading(false);
       isGooglePopupInFlight.current = false;
@@ -341,11 +344,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setWorkspaceError(null);
     try {
       const result = await signInWithEmailAndPassword(auth, email, password);
-      setFirebaseUser(result.user);
       const profile = await initializeUserWorkspace(result.user, {
         isSignup: false,
         force: true,
       });
+      setFirebaseUser(result.user);
       setUserProfile(profile);
       setIsLoading(false);
       isExplicitAuthFlowRef.current = false;
@@ -381,7 +384,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setWorkspaceError(null);
     try {
       const result = await createUserWithEmailAndPassword(auth, email, password);
-      setFirebaseUser(result.user);
       if (fullName) {
         await updateProfile(result.user, { displayName: fullName }).catch(() => {});
       }
@@ -395,6 +397,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         force: true,
       });
 
+      setFirebaseUser(result.user);
       setUserProfile(profile);
       setIsLoading(false);
       isExplicitAuthFlowRef.current = false;
@@ -448,6 +451,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         fullName: userProfile?.displayName || activeUser.displayName || undefined,
         storeName: cleanStoreName,
         isSignup: false,
+        ensureWelcomeEmail: true,
         force: true,
       });
       setUserProfile(prev => {

@@ -33,6 +33,22 @@ export interface EmailQueueItem {
   sent_at?: string | null;
 }
 
+export interface WelcomeWebhookDispatchResult {
+  attempted: boolean;
+  dispatched: boolean;
+  status: 'SENT' | 'SKIPPED' | 'FAILED' | 'NOT_CONFIGURED' | 'PENDING_POLLER';
+  reason?: string;
+}
+
+export interface WelcomeEmailDiagnosticStages {
+  stage1_signup_completed: boolean;
+  stage2_welcome_trigger_invoked: boolean;
+  stage3_vercel_endpoint_accepted: boolean;
+  stage4_apps_script_processed: boolean;
+  stage5_email_provider_accepted: boolean;
+  stage6_final_status_recorded: string;
+}
+
 export interface WorkspaceSyncResponse {
   success: boolean;
   migrationRequired?: boolean;
@@ -52,12 +68,40 @@ export interface WorkspaceSyncResponse {
     queued: boolean;
     queueId?: string | null;
     idempotencyKey?: string | null;
+    webhookDispatch?: WelcomeWebhookDispatchResult;
   };
+  diagnostics?: WelcomeEmailDiagnosticStages;
   error?: string;
 }
 
+export interface EmailAutomationStatusResponse {
+  configured: {
+    supabaseUrl: boolean;
+    supabaseSecretKey: boolean;
+    supabaseFallbackAnonKey?: boolean;
+    appsScriptWebhookUrl: boolean;
+    appsScriptWebhookSecret: boolean;
+    appUrl: string;
+  };
+  appsScriptUrlValidation?: {
+    valid: boolean;
+    warning?: string;
+  };
+  appsScriptProbe?: {
+    reachable: boolean;
+    status: string;
+    remainingDailyQuota?: number;
+    error?: string;
+  } | null;
+  schedule: {
+    dailyInventoryAlertTime: string;
+    welcomeEmailMode: string;
+  };
+}
+
 // Track UIDs synced in the current browser session so page refreshes or React re-renders
-// do not repeatedly invoke workspace sync unless onboarding / signup explicitly triggers it.
+// do not repeatedly invoke workspace sync unless onboarding / signup explicitly triggers it
+// or a welcome email dispatch previously failed.
 const syncedSessionUids = new Set<string>();
 
 export async function syncFirebaseWorkspaceAndWelcomeEmail(
@@ -66,6 +110,7 @@ export async function syncFirebaseWorkspaceAndWelcomeEmail(
     fullName?: string;
     storeName?: string;
     isSignup?: boolean;
+    ensureWelcomeEmail?: boolean;
     force?: boolean;
   }
 ): Promise<WorkspaceSyncResponse> {
@@ -74,7 +119,12 @@ export async function syncFirebaseWorkspaceAndWelcomeEmail(
   }
 
   const cacheKey = `${firebaseUser.uid}:${options?.isSignup ? 'signup' : 'login'}:${options?.storeName || ''}`;
-  if (!options?.force && !options?.isSignup && syncedSessionUids.has(cacheKey)) {
+  if (
+    !options?.force &&
+    !options?.isSignup &&
+    !options?.ensureWelcomeEmail &&
+    syncedSessionUids.has(cacheKey)
+  ) {
     return { success: true };
   }
 
@@ -87,8 +137,9 @@ export async function syncFirebaseWorkspaceAndWelcomeEmail(
   const provider =
     firebaseUser.providerData[0]?.providerId === 'google.com' ? 'google.com' : 'password';
 
+  let idToken = '';
   try {
-    const idToken = await firebaseUser.getIdToken();
+    idToken = await firebaseUser.getIdToken();
     const response = await fetch('/api/auth/sync-workspace', {
       method: 'POST',
       headers: {
@@ -99,18 +150,20 @@ export async function syncFirebaseWorkspaceAndWelcomeEmail(
         fullName,
         storeName,
         isSignup: Boolean(options?.isSignup),
+        ensureWelcomeEmail: Boolean(options?.ensureWelcomeEmail || options?.isSignup),
       }),
     });
 
     if (response.ok) {
       const data = (await response.json()) as WorkspaceSyncResponse;
-      if (data.success) {
+      const dispatchStatus = data.welcomeEmail?.webhookDispatch?.status;
+      if (data.success && dispatchStatus !== 'FAILED') {
         syncedSessionUids.add(cacheKey);
       }
       return data;
     }
   } catch {
-    // Fallback to direct Supabase RPC if running in static preview
+    // Fallback to direct Supabase RPC if serverless route is temporarily unreachable
   }
 
   const supabase = getSupabase();
@@ -126,7 +179,7 @@ export async function syncFirebaseWorkspaceAndWelcomeEmail(
       p_store_name: storeName || null,
       p_provider: provider,
       p_avatar_url: firebaseUser.photoURL || '',
-      p_is_signup: Boolean(options?.isSignup),
+      p_is_signup: Boolean(options?.isSignup || options?.ensureWelcomeEmail),
     });
 
     if (error) {
@@ -139,6 +192,28 @@ export async function syncFirebaseWorkspaceAndWelcomeEmail(
         migrationRequired: isMissingRpc,
         error: error.message,
       };
+    }
+
+    // If a welcome email was queued in Supabase via fallback, attempt to notify the backend retry endpoint
+    if ((data?.welcome_queued || options?.isSignup || options?.ensureWelcomeEmail) && idToken) {
+      try {
+        const retryRes = await fetch('/api/email/welcome/retry', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({ fullName, storeName }),
+        });
+        if (retryRes.ok) {
+          const retryData = (await retryRes.json()) as WorkspaceSyncResponse;
+          if (retryData.success) {
+            return retryData;
+          }
+        }
+      } catch {
+        // Non-blocking fallback; row remains PENDING in public.email_queue for Apps Script poller
+      }
     }
 
     syncedSessionUids.add(cacheKey);
@@ -157,6 +232,58 @@ export async function syncFirebaseWorkspaceAndWelcomeEmail(
       error: err?.message || 'Failed to sync Firebase workspace with Supabase',
     };
   }
+}
+
+export async function retryWelcomeEmail(
+  firebaseUser: FirebaseUser | null,
+  options?: { fullName?: string; storeName?: string }
+): Promise<WorkspaceSyncResponse> {
+  if (!firebaseUser?.uid || !firebaseUser?.email) {
+    return { success: false, error: 'You must be signed in to retry welcome email delivery.' };
+  }
+
+  try {
+    const idToken = await firebaseUser.getIdToken();
+    const res = await fetch('/api/email/welcome/retry', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`,
+      },
+      body: JSON.stringify({
+        fullName: options?.fullName || firebaseUser.displayName || undefined,
+        storeName: options?.storeName || undefined,
+      }),
+    });
+
+    if (res.ok) {
+      return (await res.json()) as WorkspaceSyncResponse;
+    }
+  } catch {
+    // Fallback to syncFirebaseWorkspaceAndWelcomeEmail with force + ensureWelcomeEmail
+  }
+
+  return syncFirebaseWorkspaceAndWelcomeEmail(firebaseUser, {
+    fullName: options?.fullName,
+    storeName: options?.storeName,
+    isSignup: true,
+    ensureWelcomeEmail: true,
+    force: true,
+  });
+}
+
+export async function fetchEmailAutomationStatus(
+  probe = false
+): Promise<EmailAutomationStatusResponse | null> {
+  try {
+    const res = await fetch(`/api/email/status${probe ? '?probe=true' : ''}`);
+    if (res.ok) {
+      return (await res.json()) as EmailAutomationStatusResponse;
+    }
+  } catch {
+    // Ignore in offline/static mode
+  }
+  return null;
 }
 
 export async function fetchUserEmailPreferences(firebaseUser: FirebaseUser | null): Promise<{

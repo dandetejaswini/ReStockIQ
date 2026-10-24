@@ -18,13 +18,32 @@
     --color-critical: #B42335;
   }
 
+  *, *::before, *::after {
+    box-sizing: border-box;
+  }
+
+  html,
   body {
+    width: 100%;
+    max-width: 100%;
+    margin: 0;
+    padding: 0;
     background-color: #F8F6F2;
     color: #46362F;
     font-family: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     overflow-x: hidden;
+    overflow-x: clip;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  #root {
+    width: 100%;
+    max-width: 100%;
+    min-height: 100vh;
+    overflow-x: hidden;
+    overflow-x: clip;
   }
 
   /* Editorial display headings in Cormorant Garamond */

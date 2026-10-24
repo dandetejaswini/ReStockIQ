@@ -17,24 +17,28 @@
 var AUTOMATION_TIMEZONE = 'Asia/Kolkata';
 var PRODUCT_NAME = 'ReStockIQ';
 
+function cleanPropertyValue_(val) {
+  if (!val) return '';
+  return String(val)
+    .trim()
+    .replace(/^['"]+|['"]+$/g, '')
+    .trim();
+}
+
 /**
  * 1. Load & Validate Script Properties
  */
 function getAutomationConfig_() {
   var props = PropertiesService.getScriptProperties().getProperties();
-  var supabaseUrl = (props.SUPABASE_URL || '').trim().replace(/\/+$/, '');
-  var supabaseKey = (
-    props.SUPABASE_SECRET_KEY ||
-    props.SUPABASE_SERVICE_ROLE_KEY ||
-    ''
-  ).trim();
-  var webhookSecret = (props.STOCKPILOT_APPS_SCRIPT_SECRET || '').trim();
-  var appUrl = (
+  var supabaseUrl = cleanPropertyValue_(props.SUPABASE_URL).replace(/\/+$/, '');
+  var supabaseKey = cleanPropertyValue_(
+    props.SUPABASE_SECRET_KEY || props.SUPABASE_SERVICE_ROLE_KEY || ''
+  );
+  var webhookSecret = cleanPropertyValue_(props.STOCKPILOT_APPS_SCRIPT_SECRET);
+  var appUrl = cleanPropertyValue_(
     props.STOCKPILOT_APP_URL ||
-    'https://ais-pre-fei5m4ha6ifw3sqkztnkff-717334798504.asia-southeast1.run.app'
-  )
-    .trim()
-    .replace(/\/+$/, '');
+      'https://ais-pre-fei5m4ha6ifw3sqkztnkff-717334798504.asia-southeast1.run.app'
+  ).replace(/\/+$/, '');
 
   var missing = [];
   if (!supabaseUrl) missing.push('SUPABASE_URL');
@@ -61,10 +65,12 @@ function getAutomationConfig_() {
  */
 function timingSafeEqual_(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
-  if (a.length !== b.length || a.length === 0) return false;
+  var cleanA = cleanPropertyValue_(a);
+  var cleanB = cleanPropertyValue_(b);
+  if (cleanA.length !== cleanB.length || cleanA.length === 0) return false;
   var mismatch = 0;
-  for (var i = 0; i < a.length; i++) {
-    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  for (var i = 0; i < cleanA.length; i++) {
+    mismatch |= cleanA.charCodeAt(i) ^ cleanB.charCodeAt(i);
   }
   return mismatch === 0;
 }
@@ -158,6 +164,24 @@ function supabaseRequest_(config, path, method, body, extraHeaders) {
 }
 
 /**
+ * Record dispatch status via SECURITY DEFINER RPC (works even if direct table RLS blocks non-service-role keys)
+ */
+function recordDispatchViaRpc_(config, queueId, status, errorMessage, metadata) {
+  if (!queueId) return null;
+  try {
+    return supabaseRequest_(config, 'rpc/record_email_dispatch_result', 'post', {
+      p_queue_id: queueId,
+      p_status: status,
+      p_error_message: errorMessage || null,
+      p_metadata: metadata || {}
+    });
+  } catch (err) {
+    Logger.log('Warning: record_email_dispatch_result RPC error: ' + err);
+    return null;
+  }
+}
+
+/**
  * Record an entry in public.email_delivery_logs
  */
 function insertDeliveryLog_(config, logEntry) {
@@ -189,7 +213,7 @@ function insertDeliveryLog_(config, logEntry) {
 
 /**
  * ============================================================================
- * 2. WEBHOOK ENTRY POINT: doPost(e)
+ * 2. WEBHOOK ENTRY POINTS: doGet(e) & doPost(e)
  * ============================================================================
  * Secured by STOCKPILOT_APPS_SCRIPT_SECRET.
  * Actions:
@@ -198,6 +222,27 @@ function insertDeliveryLog_(config, logEntry) {
  *   - RUN_DAILY_INVENTORY_ALERTS
  *   - HEALTH_CHECK
  */
+function doGet(e) {
+  try {
+    var config = getAutomationConfig_();
+    return jsonResponse_({
+      success: true,
+      service: PRODUCT_NAME + ' Apps Script Email Automation',
+      status: 'READY',
+      timezone: AUTOMATION_TIMEZONE,
+      supabaseConfigured: Boolean(config.supabaseUrl && config.supabaseKey),
+      remainingDailyQuota: MailApp.getRemainingDailyQuota(),
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    return jsonResponse_({
+      success: false,
+      status: 'MISCONFIGURED',
+      error: String(err && err.message ? err.message : err)
+    });
+  }
+}
+
 function doPost(e) {
   try {
     var config = getAutomationConfig_();
@@ -269,24 +314,77 @@ function handleWelcomeWebhook_(config, body) {
   if (!lock.tryLock(15000)) {
     return {
       success: false,
+      status: 'FAILED',
       error: 'Another email job is currently holding the lock'
     };
   }
 
   try {
     var queueId = body.queueId || null;
+    var targetEmail = String(body.email || '')
+      .trim()
+      .toLowerCase();
+    var targetUid = String(body.firebaseUid || '').trim();
+
+    // 1. Try looking up the exact queueId row in email_queue
     if (queueId) {
-      var rows = supabaseRequest_(
-        config,
-        'email_queue?id=eq.' + encodeURIComponent(queueId) + '&select=*',
-        'get'
-      );
-      if (rows && rows.length > 0) {
-        return dispatchWelcomeQueueRow_(config, rows[0]);
+      try {
+        var rows = supabaseRequest_(
+          config,
+          'email_queue?id=eq.' + encodeURIComponent(queueId) + '&select=*',
+          'get'
+        );
+        if (rows && rows.length > 0) {
+          return dispatchWelcomeQueueRow_(config, rows[0]);
+        }
+      } catch (lookupErr) {
+        Logger.log('Direct email_queue lookup by id failed, falling back: ' + lookupErr);
       }
     }
 
-    // Otherwise process all pending rows in email_queue
+    // 2. Try looking up by firebase_uid or recipient_email in email_queue
+    if (targetEmail || targetUid) {
+      try {
+        var filter = targetUid
+          ? 'firebase_uid=eq.' + encodeURIComponent(targetUid)
+          : 'recipient_email=ilike.' + encodeURIComponent(targetEmail);
+        var userRows = supabaseRequest_(
+          config,
+          'email_queue?template_type=eq.WELCOME&' +
+            filter +
+            '&order=created_at.desc&limit=1&select=*',
+          'get'
+        );
+        if (userRows && userRows.length > 0) {
+          return dispatchWelcomeQueueRow_(config, userRows[0]);
+        }
+      } catch (filterErr) {
+        Logger.log('Filtered email_queue lookup failed, falling back: ' + filterErr);
+      }
+    }
+
+    // 3. If webhook provided a direct email payload (e.g., direct table SELECT was blocked by RLS or row not visible),
+    // dispatch using the verified webhook payload and record via SECURITY DEFINER RPC
+    if (targetEmail && targetEmail.indexOf('@') !== -1) {
+      return dispatchWelcomeQueueRow_(config, {
+        id: queueId,
+        firebase_uid: targetUid || null,
+        recipient_email: targetEmail,
+        recipient_name: body.fullName || targetEmail.split('@')[0],
+        template_type: 'WELCOME',
+        idempotency_key:
+          body.idempotencyKey ||
+          (targetUid
+            ? 'welcome:firebase_uid:' + targetUid
+            : 'welcome:email:' + targetEmail),
+        payload: {
+          store_name: body.storeName || 'Your Retail Workspace'
+        },
+        attempts: 0
+      });
+    }
+
+    // 4. Otherwise process all pending rows in email_queue
     return processPendingEmailQueueInternal_(config);
   } finally {
     lock.releaseLock();
@@ -297,7 +395,7 @@ function handleWelcomeWebhook_(config, body) {
  * ============================================================================
  * 3. WELCOME EMAIL QUEUE PROCESSOR (Requirement A)
  * ============================================================================
- * Safely processes PENDING rows in public.email_queue.
+ * Safely processes PENDING (and retryable FAILED) rows in public.email_queue.
  * Enforces strict idempotency so a user receives at most ONE welcome email
  * across Google Sign-Up, Email/Password Sign-Up, and linked providers.
  */
@@ -322,7 +420,7 @@ function processPendingEmailQueue() {
 function processPendingEmailQueueInternal_(config) {
   var pendingRows = supabaseRequest_(
     config,
-    'email_queue?status=eq.PENDING&order=created_at.asc&limit=25',
+    'email_queue?status=in.(PENDING,FAILED)&attempts=lt.3&order=created_at.asc&limit=25',
     'get'
   );
 
@@ -354,7 +452,7 @@ function processPendingEmailQueueInternal_(config) {
   }
 
   return {
-    success: true,
+    success: failedCount === 0 || sentCount > 0 || skippedCount > 0,
     processed: pendingRows.length,
     sent: sentCount,
     skipped: skippedCount,
@@ -364,20 +462,27 @@ function processPendingEmailQueueInternal_(config) {
 }
 
 function dispatchWelcomeQueueRow_(config, row) {
-  var queueId = row.id;
+  var queueId = row.id || null;
   var recipientEmail = String(row.recipient_email || '')
     .trim()
     .toLowerCase();
 
   if (!recipientEmail || recipientEmail.indexOf('@') === -1) {
-    updateQueueRowStatus_(
-      config,
-      queueId,
-      'FAILED',
-      'Invalid recipient_email on queue row',
-      row.attempts
-    );
-    return { queueId: queueId, status: 'FAILED', error: 'Invalid email' };
+    if (queueId) {
+      updateQueueRowStatus_(
+        config,
+        queueId,
+        'FAILED',
+        'Invalid recipient_email on queue row',
+        row.attempts
+      );
+    }
+    return {
+      success: false,
+      queueId: queueId,
+      status: 'FAILED',
+      error: 'Invalid email'
+    };
   }
 
   var idempotencyKey =
@@ -388,38 +493,64 @@ function dispatchWelcomeQueueRow_(config, row) {
       ? 'welcome:user_id:' + row.user_id
       : 'welcome:email:' + recipientEmail);
 
-  // Check if a WELCOME email has ALREADY been SENT for this email, user_id, or idempotency_key
-  var alreadySentQueue = supabaseRequest_(
-    config,
-    'email_queue?template_type=eq.WELCOME&status=eq.SENT&recipient_email=ilike.' +
-      encodeURIComponent(recipientEmail) +
-      '&id=neq.' +
-      encodeURIComponent(queueId) +
-      '&select=id',
-    'get'
-  );
+  // If this specific row was already marked SENT, return SKIPPED immediately
+  if (String(row.status || '').toUpperCase() === 'SENT') {
+    return {
+      success: true,
+      queueId: queueId,
+      recipientEmail: recipientEmail,
+      status: 'SKIPPED',
+      reason: 'Welcome email row already marked SENT'
+    };
+  }
 
-  var alreadySentLog = supabaseRequest_(
-    config,
-    'email_delivery_logs?template_type=eq.WELCOME&status=eq.SENT&recipient_email=ilike.' +
-      encodeURIComponent(recipientEmail) +
-      '&select=id',
-    'get'
-  );
+  // Check if a WELCOME email has ALREADY been SENT for this email, user_id, or idempotency_key
+  var alreadySentQueue = [];
+  var alreadySentLog = [];
+  try {
+    var neqClause = queueId ? '&id=neq.' + encodeURIComponent(queueId) : '';
+    alreadySentQueue =
+      supabaseRequest_(
+        config,
+        'email_queue?template_type=eq.WELCOME&status=eq.SENT&recipient_email=ilike.' +
+          encodeURIComponent(recipientEmail) +
+          neqClause +
+          '&select=id',
+        'get'
+      ) || [];
+  } catch (qErr) {
+    Logger.log('Deduplication check on email_queue warning: ' + qErr);
+  }
+
+  try {
+    alreadySentLog =
+      supabaseRequest_(
+        config,
+        'email_delivery_logs?template_type=eq.WELCOME&status=eq.SENT&recipient_email=ilike.' +
+          encodeURIComponent(recipientEmail) +
+          '&select=id',
+        'get'
+      ) || [];
+  } catch (lErr) {
+    Logger.log('Deduplication check on email_delivery_logs warning: ' + lErr);
+  }
 
   if (
     (alreadySentQueue && alreadySentQueue.length > 0) ||
     (alreadySentLog && alreadySentLog.length > 0)
   ) {
-    updateQueueRowStatus_(
-      config,
-      queueId,
-      'SKIPPED',
-      'Duplicate prevented: WELCOME email already sent to ' + recipientEmail,
-      row.attempts,
-      idempotencyKey
-    );
+    if (queueId) {
+      updateQueueRowStatus_(
+        config,
+        queueId,
+        'SKIPPED',
+        'Duplicate prevented: WELCOME email already sent to ' + recipientEmail,
+        row.attempts,
+        idempotencyKey
+      );
+    }
     return {
+      success: true,
       queueId: queueId,
       recipientEmail: recipientEmail,
       status: 'SKIPPED',
@@ -427,51 +558,62 @@ function dispatchWelcomeQueueRow_(config, row) {
     };
   }
 
-  // Resolve organization_id and user_id from profiles if missing on legacy queue row
-  var orgId = row.organization_id;
-  var userId = row.user_id;
-  var recipientName = row.recipient_name;
+  // Resolve organization_id and user_id from profiles if missing on queue row
+  var orgId = row.organization_id || null;
+  var userId = row.user_id || null;
+  var recipientName = row.recipient_name || '';
   var storeName =
     row.payload && row.payload.store_name ? row.payload.store_name : '';
 
   if (!orgId || !userId || !recipientName) {
-    var profiles = supabaseRequest_(
-      config,
-      'profiles?email=ilike.' +
-        encodeURIComponent(recipientEmail) +
-        '&select=id,organization_id,full_name,store_name,firebase_uid&limit=1',
-      'get'
-    );
-    if (profiles && profiles.length > 0) {
-      userId = userId || profiles[0].id;
-      orgId = orgId || profiles[0].organization_id;
-      recipientName = recipientName || profiles[0].full_name;
-      storeName = storeName || profiles[0].store_name;
+    try {
+      var profiles = supabaseRequest_(
+        config,
+        'profiles?email=ilike.' +
+          encodeURIComponent(recipientEmail) +
+          '&select=id,organization_id,full_name,store_name,firebase_uid&limit=1',
+        'get'
+      );
+      if (profiles && profiles.length > 0) {
+        userId = userId || profiles[0].id;
+        orgId = orgId || profiles[0].organization_id;
+        recipientName = recipientName || profiles[0].full_name;
+        storeName = storeName || profiles[0].store_name;
+      }
+    } catch (profErr) {
+      Logger.log('Profile lookup warning: ' + profErr);
     }
   }
 
   if (orgId && !storeName) {
-    var orgs = supabaseRequest_(
-      config,
-      'organizations?id=eq.' + encodeURIComponent(orgId) + '&select=name&limit=1',
-      'get'
-    );
-    if (orgs && orgs.length > 0) {
-      storeName = orgs[0].name;
+    try {
+      var orgs = supabaseRequest_(
+        config,
+        'organizations?id=eq.' + encodeURIComponent(orgId) + '&select=name&limit=1',
+        'get'
+      );
+      if (orgs && orgs.length > 0) {
+        storeName = orgs[0].name;
+      }
+    } catch (orgErr) {
+      Logger.log('Organization lookup warning: ' + orgErr);
     }
   }
 
   var remainingQuota = MailApp.getRemainingDailyQuota();
   if (remainingQuota <= 0) {
-    updateQueueRowStatus_(
-      config,
-      queueId,
-      'FAILED',
-      'MailApp daily email quota exhausted (remaining: 0)',
-      row.attempts,
-      idempotencyKey
-    );
+    if (queueId) {
+      updateQueueRowStatus_(
+        config,
+        queueId,
+        'FAILED',
+        'MailApp daily email quota exhausted (remaining: 0)',
+        row.attempts,
+        idempotencyKey
+      );
+    }
     return {
+      success: false,
       queueId: queueId,
       recipientEmail: recipientEmail,
       status: 'FAILED',
@@ -479,20 +621,26 @@ function dispatchWelcomeQueueRow_(config, row) {
     };
   }
 
-  // Mark PROCESSING
-  supabaseRequest_(
-    config,
-    'email_queue?id=eq.' + encodeURIComponent(queueId),
-    'patch',
-    {
-      status: 'PROCESSING',
-      idempotency_key: idempotencyKey,
-      organization_id: orgId || null,
-      user_id: userId || null,
-      updated_at: new Date().toISOString()
-    },
-    { Prefer: 'return=minimal' }
-  );
+  // Mark PROCESSING if direct table access is available
+  if (queueId) {
+    try {
+      supabaseRequest_(
+        config,
+        'email_queue?id=eq.' + encodeURIComponent(queueId),
+        'patch',
+        {
+          status: 'PROCESSING',
+          idempotency_key: idempotencyKey,
+          organization_id: orgId || null,
+          user_id: userId || null,
+          updated_at: new Date().toISOString()
+        },
+        { Prefer: 'return=minimal' }
+      );
+    } catch (procErr) {
+      Logger.log('Mark PROCESSING warning: ' + procErr);
+    }
+  }
 
   var emailContent = buildWelcomeEmailTemplate_({
     fullName: recipientName || recipientEmail.split('@')[0],
@@ -511,45 +659,53 @@ function dispatchWelcomeQueueRow_(config, row) {
     });
 
     var nowIso = new Date().toISOString();
-    supabaseRequest_(
-      config,
-      'email_queue?id=eq.' + encodeURIComponent(queueId),
-      'patch',
-      {
-        status: 'SENT',
-        subject: emailContent.subject,
-        idempotency_key: idempotencyKey,
-        organization_id: orgId || null,
-        user_id: userId || null,
-        attempts: Number(row.attempts || 0) + 1,
-        error_message: null,
-        processed_at: nowIso,
-        sent_at: nowIso,
-        updated_at: nowIso
-      },
-      { Prefer: 'return=minimal' }
-    );
+    var metadataObj = {
+      store_name: storeName || 'Your Retail Workspace',
+      dispatched_by: 'apps_script_mailapp',
+      timezone: AUTOMATION_TIMEZONE
+    };
 
-    if (orgId) {
-      insertDeliveryLog_(config, {
-        organization_id: orgId,
-        user_id: userId,
-        firebase_uid: row.firebase_uid || null,
-        recipient_email: recipientEmail,
-        template_type: 'WELCOME',
-        status: 'SENT',
-        subject: emailContent.subject,
-        idempotency_key: idempotencyKey,
-        queue_id: queueId,
-        metadata: {
-          store_name: storeName || 'Your Retail Workspace',
-          dispatched_by: 'apps_script_mailapp',
-          timezone: AUTOMATION_TIMEZONE
+    if (queueId) {
+      try {
+        supabaseRequest_(
+          config,
+          'email_queue?id=eq.' + encodeURIComponent(queueId),
+          'patch',
+          {
+            status: 'SENT',
+            subject: emailContent.subject,
+            idempotency_key: idempotencyKey,
+            organization_id: orgId || null,
+            user_id: userId || null,
+            attempts: Number(row.attempts || 0) + 1,
+            error_message: null,
+            processed_at: nowIso,
+            sent_at: nowIso,
+            updated_at: nowIso
+          },
+          { Prefer: 'return=minimal' }
+        );
+        if (orgId) {
+          insertDeliveryLog_(config, {
+            organization_id: orgId,
+            user_id: userId,
+            firebase_uid: row.firebase_uid || null,
+            recipient_email: recipientEmail,
+            template_type: 'WELCOME',
+            status: 'SENT',
+            subject: emailContent.subject,
+            idempotency_key: idempotencyKey,
+            queue_id: queueId,
+            metadata: metadataObj
+          });
         }
-      });
+      } catch (patchErr) {
+        recordDispatchViaRpc_(config, queueId, 'SENT', null, metadataObj);
+      }
     }
 
     return {
+      success: true,
       queueId: queueId,
       recipientEmail: recipientEmail,
       status: 'SENT',
@@ -559,14 +715,16 @@ function dispatchWelcomeQueueRow_(config, row) {
     var errMsg = String(
       sendErr && sendErr.message ? sendErr.message : sendErr
     );
-    updateQueueRowStatus_(
-      config,
-      queueId,
-      'FAILED',
-      errMsg,
-      row.attempts,
-      idempotencyKey
-    );
+    if (queueId) {
+      updateQueueRowStatus_(
+        config,
+        queueId,
+        'FAILED',
+        errMsg,
+        row.attempts,
+        idempotencyKey
+      );
+    }
 
     if (orgId) {
       insertDeliveryLog_(config, {
@@ -584,6 +742,7 @@ function dispatchWelcomeQueueRow_(config, row) {
     }
 
     return {
+      success: false,
       queueId: queueId,
       recipientEmail: recipientEmail,
       status: 'FAILED',
@@ -600,6 +759,7 @@ function updateQueueRowStatus_(
   currentAttempts,
   idempotencyKey
 ) {
+  if (!queueId) return;
   var patch = {
     status: status,
     attempts: Number(currentAttempts || 0) + 1,
@@ -610,13 +770,17 @@ function updateQueueRowStatus_(
   if (idempotencyKey) {
     patch.idempotency_key = idempotencyKey;
   }
-  supabaseRequest_(
-    config,
-    'email_queue?id=eq.' + encodeURIComponent(queueId),
-    'patch',
-    patch,
-    { Prefer: 'return=minimal' }
-  );
+  try {
+    supabaseRequest_(
+      config,
+      'email_queue?id=eq.' + encodeURIComponent(queueId),
+      'patch',
+      patch,
+      { Prefer: 'return=minimal' }
+    );
+  } catch (err) {
+    recordDispatchViaRpc_(config, queueId, status, errorMessage, {});
+  }
 }
 
 /**

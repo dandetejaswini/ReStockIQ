@@ -633,10 +633,12 @@ BEGIN
         SET
             firebase_uid = COALESCE(firebase_uid, trim(p_firebase_uid)),
             user_id = COALESCE(user_id, v_profile_id),
-            organization_id = COALESCE(organization_id, v_org_id)
+            organization_id = COALESCE(organization_id, v_org_id),
+            status = CASE WHEN status = 'FAILED' THEN 'PENDING' ELSE status END,
+            updated_at = timezone('utc'::text, now())
         WHERE id = v_existing_queue.id;
 
-        IF v_existing_queue.status = 'PENDING' THEN
+        IF v_existing_queue.status IN ('PENDING', 'FAILED') THEN
             v_queue_id := v_existing_queue.id;
             v_welcome_queued := true;
         END IF;
@@ -1023,4 +1025,14 @@ BEGIN
     );
 END;
 $$;
+
+-- 13. Explicit Grants for Table & RPC Execution
+GRANT SELECT, INSERT, UPDATE ON public.email_queue TO authenticated, service_role;
+GRANT SELECT, INSERT, UPDATE ON public.email_delivery_logs TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.sync_firebase_workspace_and_welcome(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, BOOLEAN) TO anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.get_firebase_user_email_preferences(TEXT, TEXT) TO anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.update_firebase_user_email_preferences(TEXT, TEXT, BOOLEAN, BOOLEAN, BOOLEAN, BOOLEAN, BOOLEAN, TEXT) TO anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.record_email_dispatch_result(UUID, TEXT, TEXT, JSONB) TO anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.get_firebase_workspace_snapshot(TEXT, TEXT) TO anon, authenticated, service_role;
+
 

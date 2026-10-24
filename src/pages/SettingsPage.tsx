@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { 
   Settings, 
   User, 
@@ -15,20 +16,26 @@ import {
   Server,
   AlertTriangle,
   Mail,
-  Clock
+  Clock,
+  RefreshCw,
+  Loader2
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { useAuth } from '../context/AuthContext';
 import { ConfirmationModal } from '../components/common/ConfirmationModal';
-import { getBackendConfig } from '../services/config';
+import { getBackendConfig, CANONICAL_SUPABASE_URL } from '../services/config';
 import { 
   fetchUserEmailPreferences, 
   saveUserEmailPreferences, 
+  retryWelcomeEmail,
+  fetchEmailAutomationStatus,
+  EmailAutomationStatusResponse,
   EmailDeliveryLogItem, 
   EmailQueueItem 
 } from '../services/emailAutomationService';
 
 export const SettingsPage: React.FC = () => {
+  const [searchParams, setSearchParams] = useSearchParams();
   const { 
     currentUser, 
     resetAllSeedData, 
@@ -36,13 +43,45 @@ export const SettingsPage: React.FC = () => {
     inventory, 
     suppliers, 
     orders, 
-    requests 
+    requests,
+    isSupabaseLiveConnected,
+    supabaseConnectionStatus,
+    supabaseVerifiedAt,
+    supabaseConfigError,
+    recheckSupabaseConnection
   } = useApp();
 
   const { firebaseUser, userProfile } = useAuth();
   const backendConfig = getBackendConfig();
 
-  const [activeTab, setActiveTab] = useState<'profile' | 'inventory' | 'notifications' | 'supabase' | 'demo'>('inventory');
+  const initialTabParam = searchParams.get('tab');
+  const validTabs = ['profile', 'inventory', 'notifications', 'supabase'] as const;
+  const [activeTab, setActiveTab] = useState<'profile' | 'inventory' | 'notifications' | 'supabase' | 'demo'>(
+    validTabs.includes(initialTabParam as any) ? (initialTabParam as any) : 'inventory'
+  );
+  const [isRecheckingSupabase, setIsRecheckingSupabase] = useState(false);
+
+  useEffect(() => {
+    const tabParam = searchParams.get('tab');
+    if (tabParam && validTabs.includes(tabParam as any) && tabParam !== activeTab) {
+      setActiveTab(tabParam as any);
+    }
+  }, [searchParams]);
+
+  const handleSelectTab = (tab: 'profile' | 'inventory' | 'notifications' | 'supabase') => {
+    setActiveTab(tab);
+    setSearchParams({ tab }, { replace: true });
+  };
+
+  const handleRecheckConnection = async () => {
+    setIsRecheckingSupabase(true);
+    try {
+      await recheckSupabaseConnection();
+    } finally {
+      setIsRecheckingSupabase(false);
+    }
+  };
+
   const [forecastHorizon, setForecastHorizon] = useState('7');
   const [pageSize, setPageSize] = useState('8');
   const [currency, setCurrency] = useState('INR');
@@ -53,39 +92,85 @@ export const SettingsPage: React.FC = () => {
   const [weeklyBriefing, setWeeklyBriefing] = useState(true);
   const [alertFrequency, setAlertFrequency] = useState<'INSTANT' | 'DAILY_DIGEST' | 'WEEKLY'>('INSTANT');
   const [isSavingNotifications, setIsSavingNotifications] = useState(false);
+  const [isRetryingWelcome, setIsRetryingWelcome] = useState(false);
   const [notificationSyncMessage, setNotificationSyncMessage] = useState<string | null>(null);
   const [notificationSyncError, setNotificationSyncError] = useState<string | null>(null);
   const [deliveryLogs, setDeliveryLogs] = useState<EmailDeliveryLogItem[]>([]);
   const [emailQueueItems, setEmailQueueItems] = useState<EmailQueueItem[]>([]);
+  const [emailAutomationStatus, setEmailAutomationStatus] = useState<EmailAutomationStatusResponse | null>(null);
 
   const [isConfirmingSeedReset, setIsConfirmingSeedReset] = useState(false);
   const [isConfirmingChatReset, setIsConfirmingChatReset] = useState(false);
   const [saveToast, setSaveToast] = useState(false);
 
+  const loadEmailPreferencesAndQueue = async () => {
+    if (!firebaseUser) return;
+    const [res, statusRes] = await Promise.all([
+      fetchUserEmailPreferences(firebaseUser),
+      fetchEmailAutomationStatus(false),
+    ]);
+    if (statusRes) {
+      setEmailAutomationStatus(statusRes);
+    }
+    if (res.success && res.preferences) {
+      setLowStockAlerts(res.preferences.stockout_alerts);
+      setPriceChangeAlerts(res.preferences.price_change_alerts);
+      setApprovalAlerts(res.preferences.pending_approval_digest);
+      setDailyInventoryAlerts(res.preferences.daily_inventory_alerts ?? true);
+      setWeeklyBriefing(res.preferences.weekly_briefing ?? true);
+      setAlertFrequency(res.preferences.frequency || 'INSTANT');
+      setNotificationSyncError(null);
+    } else if (res.migrationRequired && res.error) {
+      setNotificationSyncError(res.error);
+    }
+    if (res.deliveryLogs) setDeliveryLogs(res.deliveryLogs);
+    if (res.emailQueue) setEmailQueueItems(res.emailQueue);
+  };
+
   useEffect(() => {
     let isMounted = true;
     if (firebaseUser) {
-      fetchUserEmailPreferences(firebaseUser).then((res) => {
-        if (!isMounted) return;
-        if (res.success && res.preferences) {
-          setLowStockAlerts(res.preferences.stockout_alerts);
-          setPriceChangeAlerts(res.preferences.price_change_alerts);
-          setApprovalAlerts(res.preferences.pending_approval_digest);
-          setDailyInventoryAlerts(res.preferences.daily_inventory_alerts ?? true);
-          setWeeklyBriefing(res.preferences.weekly_briefing ?? true);
-          setAlertFrequency(res.preferences.frequency || 'INSTANT');
-          setNotificationSyncError(null);
-        } else if (res.migrationRequired && res.error) {
-          setNotificationSyncError(res.error);
-        }
-        if (res.deliveryLogs) setDeliveryLogs(res.deliveryLogs);
-        if (res.emailQueue) setEmailQueueItems(res.emailQueue);
-      });
+      loadEmailPreferencesAndQueue().catch(() => {});
     }
     return () => {
       isMounted = false;
     };
   }, [firebaseUser]);
+
+  const handleRetryWelcomeEmail = async () => {
+    if (!firebaseUser || isRetryingWelcome) return;
+    setIsRetryingWelcome(true);
+    setNotificationSyncMessage(null);
+    setNotificationSyncError(null);
+    try {
+      const res = await retryWelcomeEmail(firebaseUser, {
+        fullName: userProfile?.displayName || firebaseUser.displayName || undefined,
+        storeName: userProfile?.storeName || undefined,
+      });
+      await loadEmailPreferencesAndQueue();
+      const dispatch = res.welcomeEmail?.webhookDispatch;
+      if (dispatch?.status === 'SENT') {
+        setNotificationSyncMessage('Welcome email dispatched and verified via Google Apps Script.');
+      } else if (dispatch?.status === 'SKIPPED') {
+        setNotificationSyncMessage(dispatch.reason || 'Welcome email was already delivered to this account.');
+      } else if (dispatch?.status === 'PENDING_POLLER') {
+        setNotificationSyncMessage(
+          dispatch.reason ||
+            'Welcome email is queued in Supabase (PENDING). Configure STOCKPILOT_APPS_SCRIPT_URL and STOCKPILOT_APPS_SCRIPT_SECRET in Vercel for instant webhook dispatch, or wait for the 5-minute Apps Script queue trigger.'
+        );
+      } else if (dispatch?.status === 'FAILED') {
+        setNotificationSyncError(
+          dispatch.reason || 'Welcome email webhook dispatch failed. Check Apps Script configuration.'
+        );
+      } else if (res.success) {
+        setNotificationSyncMessage('Welcome email queue synchronized.');
+      } else {
+        setNotificationSyncError(res.error || 'Could not retry welcome email.');
+      }
+    } finally {
+      setIsRetryingWelcome(false);
+    }
+  };
 
   const handleSavePreferences = (e: React.FormEvent) => {
     e.preventDefault();
@@ -119,9 +204,9 @@ export const SettingsPage: React.FC = () => {
   };
 
   return (
-    <div className="space-y-6 max-w-4xl mx-auto py-2 font-sans">
+    <div className="space-y-6 max-w-4xl w-full min-w-0 mx-auto py-2 font-sans">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pb-2 border-b border-[#E7E0D8]">
-        <div>
+        <div className="min-w-0">
           <h1 className="font-serif text-2xl font-normal tracking-tight text-[#46362F]">
             Workspace Settings
           </h1>
@@ -131,17 +216,18 @@ export const SettingsPage: React.FC = () => {
         </div>
 
         {saveToast && (
-          <span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold text-[#8A9A83] bg-[#8A9A83]/10 border border-[#8A9A83]/30 rounded">
+          <span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold text-[#8A9A83] bg-[#8A9A83]/10 border border-[#8A9A83]/30 rounded w-fit">
             <CheckCircle2 className="w-4 h-4 text-[#8A9A83]" />
             <span>Preferences Saved</span>
           </span>
         )}
       </div>
 
-      <div className="flex flex-wrap items-center gap-1 p-1 bg-[#F8F6F2] border border-[#E7E0D8] rounded-lg w-fit">
+      <div className="flex flex-wrap items-center gap-1 p-1 bg-[#F8F6F2] border border-[#E7E0D8] rounded-lg w-full sm:w-fit">
         <button
-          onClick={() => setActiveTab('inventory')}
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded transition-colors ${
+          type="button"
+          onClick={() => handleSelectTab('inventory')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded transition-colors cursor-pointer ${
             activeTab === 'inventory' ? 'bg-[#46362F] text-white shadow-2xs' : 'text-[#6B625B] hover:text-[#46362F]'
           }`}
         >
@@ -150,8 +236,9 @@ export const SettingsPage: React.FC = () => {
         </button>
 
         <button
-          onClick={() => setActiveTab('notifications')}
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded transition-colors ${
+          type="button"
+          onClick={() => handleSelectTab('notifications')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded transition-colors cursor-pointer ${
             activeTab === 'notifications' ? 'bg-[#46362F] text-white shadow-2xs' : 'text-[#6B625B] hover:text-[#46362F]'
           }`}
         >
@@ -160,8 +247,9 @@ export const SettingsPage: React.FC = () => {
         </button>
 
         <button
-          onClick={() => setActiveTab('supabase')}
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded transition-colors ${
+          type="button"
+          onClick={() => handleSelectTab('supabase')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded transition-colors cursor-pointer ${
             activeTab === 'supabase' ? 'bg-[#46362F] text-white shadow-2xs' : 'text-[#6B625B] hover:text-[#46362F]'
           }`}
         >
@@ -170,8 +258,9 @@ export const SettingsPage: React.FC = () => {
         </button>
 
         <button
-          onClick={() => setActiveTab('profile')}
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded transition-colors ${
+          type="button"
+          onClick={() => handleSelectTab('profile')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded transition-colors cursor-pointer ${
             activeTab === 'profile' ? 'bg-[#46362F] text-white shadow-2xs' : 'text-[#6B625B] hover:text-[#46362F]'
           }`}
         >
@@ -361,15 +450,46 @@ export const SettingsPage: React.FC = () => {
 
           {/* Verified Email Queue & Delivery Audit Log */}
           <div className="bg-white border border-[#E7E0D8] rounded-xl p-6 sm:p-8 shadow-2xs space-y-4">
-            <div className="flex items-center gap-2">
-              <Mail className="w-4 h-4 text-[#46362F]" />
-              <div>
-                <h3 className="text-sm font-semibold text-[#46362F]">Workspace Email Queue & Delivery Ledger</h3>
-                <p className="text-[11px] text-[#6B625B]">
-                  Live records from <code className="font-mono text-[#46362F]">public.email_queue</code> and <code className="font-mono text-[#46362F]">public.email_delivery_logs</code>
-                </p>
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Mail className="w-4 h-4 text-[#46362F]" />
+                <div>
+                  <h3 className="text-sm font-semibold text-[#46362F]">Workspace Email Queue & Delivery Ledger</h3>
+                  <p className="text-[11px] text-[#6B625B]">
+                    Live records from <code className="font-mono text-[#46362F]">public.email_queue</code> and <code className="font-mono text-[#46362F]">public.email_delivery_logs</code>
+                  </p>
+                </div>
               </div>
+
+              {(!emailQueueItems.some((item) => item.template_type === 'WELCOME' && item.status === 'SENT') ||
+                emailQueueItems.some(
+                  (item) => item.template_type === 'WELCOME' && (item.status === 'PENDING' || item.status === 'FAILED')
+                )) && (
+                <button
+                  type="button"
+                  onClick={handleRetryWelcomeEmail}
+                  disabled={isRetryingWelcome}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-[#E7E0D8] bg-[#F8F6F2] hover:bg-[#E8E2F0]/60 text-[#46362F] transition-colors disabled:opacity-50 w-fit cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isRetryingWelcome ? 'animate-spin' : ''}`} />
+                  <span>{isRetryingWelcome ? 'Dispatching...' : 'Retry Welcome Email'}</span>
+                </button>
+              )}
             </div>
+
+            {emailAutomationStatus &&
+              (!emailAutomationStatus.configured.appsScriptWebhookUrl ||
+                !emailAutomationStatus.configured.appsScriptWebhookSecret) && (
+                <div className="p-3 bg-[#FFF8EB] border border-[#EAAA00]/40 rounded-lg text-[#9A6700] text-[11px] flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-semibold">Instant Apps Script Webhook Not Set in Server Environment:</span>{' '}
+                    Welcome emails are queued in <code className="font-mono">public.email_queue</code> for the 5-minute Apps Script poller. For instant delivery on signup, set{' '}
+                    <code className="font-mono">STOCKPILOT_APPS_SCRIPT_URL</code> and{' '}
+                    <code className="font-mono">STOCKPILOT_APPS_SCRIPT_SECRET</code> in Vercel Environment Variables.
+                  </div>
+                </div>
+              )}
 
             {emailQueueItems.length === 0 && deliveryLogs.length === 0 ? (
               <div className="p-4 bg-[#F8F6F2] border border-[#E7E0D8] rounded-lg text-[#6B625B] text-[11px]">
@@ -421,72 +541,108 @@ export const SettingsPage: React.FC = () => {
       )}
 
       {activeTab === 'supabase' && (
-        <div className="space-y-6 text-xs">
+        <div className="space-y-6 text-xs min-w-0">
           {/* Connection Status & Mode Banner */}
-          <div className="bg-white border border-[#E7E0D8] rounded-xl p-6 sm:p-8 shadow-2xs space-y-4">
-            <div className="flex items-center justify-between border-b border-[#E7E0D8] pb-4">
-              <div className="flex items-center gap-2.5">
-                <Database className="w-5 h-5 text-[#46362F]" />
-                <div>
+          <div className="bg-white border border-[#E7E0D8] rounded-xl p-5 sm:p-8 shadow-2xs space-y-4 min-w-0">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[#E7E0D8] pb-4">
+              <div className="flex items-start sm:items-center gap-2.5 min-w-0">
+                <Database className="w-5 h-5 text-[#46362F] shrink-0 mt-0.5 sm:mt-0" />
+                <div className="min-w-0">
                   <h2 className="text-sm font-semibold text-[#46362F]">Supabase Connection & Tenant Isolation</h2>
-                  <p className="text-[11px] text-[#6B625B] mt-0.5">PostgreSQL database, Row Level Security (RLS) & Auth state</p>
+                  <p className="text-[11px] text-[#6B625B] mt-0.5">
+                    PostgreSQL database, Row Level Security (RLS) & live API key verification
+                  </p>
                 </div>
               </div>
-              <span className={`px-2.5 py-1 text-xs font-semibold rounded border inline-flex items-center gap-1.5 ${
-                backendConfig.isSupabaseConfigured
-                  ? 'text-[#8A9A83] bg-[#8A9A83]/10 border-[#8A9A83]/30'
-                  : 'text-[#C97A63] bg-[#C97A63]/10 border-[#C97A63]/30'
-              }`}>
-                {backendConfig.isSupabaseConfigured ? (
-                  <>
-                    <CheckCircle2 className="w-3.5 h-3.5" />
+
+              <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+                {/* Real Live Connection Status Badge */}
+                {supabaseConnectionStatus === 'checking' || isRecheckingSupabase ? (
+                  <span className="px-2.5 py-1 text-xs font-semibold rounded border inline-flex items-center gap-1.5 text-[#46362F] bg-[#F8F6F2] border-[#E7E0D8]">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-[#8A9A83]" />
+                    <span>Checking Connection…</span>
+                  </span>
+                ) : isSupabaseLiveConnected ? (
+                  <span className="px-2.5 py-1 text-xs font-semibold rounded border inline-flex items-center gap-1.5 text-[#327456] bg-[#EBF7F0] border-[#BCE8D3]">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-[#327456]" />
                     <span>Supabase Live Connected</span>
-                  </>
+                  </span>
+                ) : supabaseConnectionStatus === 'config_error' ? (
+                  <span className="px-2.5 py-1 text-xs font-semibold rounded border inline-flex items-center gap-1.5 text-[#B42335] bg-[#FDF0F2] border-[#F8C8CE]">
+                    <AlertTriangle className="w-3.5 h-3.5 text-[#B42335]" />
+                    <span>Configuration Error (Invalid API Key)</span>
+                  </span>
+                ) : supabaseConnectionStatus === 'connection_failed' ? (
+                  <span className="px-2.5 py-1 text-xs font-semibold rounded border inline-flex items-center gap-1.5 text-[#B7791F] bg-[#FFF8EB] border-[#EAAA00]/40">
+                    <AlertTriangle className="w-3.5 h-3.5 text-[#B7791F]" />
+                    <span>Connection Failed</span>
+                  </span>
                 ) : (
-                  <>
-                    <ShieldCheck className="w-3.5 h-3.5" />
-                    <span>Not Connected</span>
-                  </>
+                  <span className="px-2.5 py-1 text-xs font-semibold rounded border inline-flex items-center gap-1.5 text-[#6B625B] bg-[#F8F6F2] border-[#E7E0D8]">
+                    <ShieldCheck className="w-3.5 h-3.5 text-[#8A9A83]" />
+                    <span>Not Configured</span>
+                  </span>
                 )}
-              </span>
+
+                <button
+                  type="button"
+                  onClick={handleRecheckConnection}
+                  disabled={isRecheckingSupabase}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded border border-[#E7E0D8] bg-[#F8F6F2] hover:bg-[#E8E2F0]/50 text-[#46362F] transition-colors disabled:opacity-50 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isRecheckingSupabase ? 'animate-spin' : ''}`} />
+                  <span>Re-verify</span>
+                </button>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
-              <div className="p-3.5 bg-[#F8F6F2] border border-[#E7E0D8] rounded-lg">
+              <div className="p-3.5 bg-[#F8F6F2] border border-[#E7E0D8] rounded-lg min-w-0">
                 <p className="text-[10px] uppercase font-semibold text-[#6B625B]">Frontend Framework</p>
                 <p className="font-medium text-[#46362F] mt-1">Vite + React 19 SPA</p>
-                <p className="text-[10px] text-[#6B625B] mt-0.5">NEXT_PUBLIC_* envPrefix enabled</p>
+                <p className="text-[10px] text-[#6B625B] mt-0.5">VITE_* & NEXT_PUBLIC_* supported</p>
               </div>
-              <div className="p-3.5 bg-[#F8F6F2] border border-[#E7E0D8] rounded-lg">
-                <p className="text-[10px] uppercase font-semibold text-[#6B625B]">Active PostgreSQL Host</p>
-                <p className="font-mono text-[11px] text-[#46362F] mt-1 truncate">
-                  {backendConfig.isSupabaseConfigured ? backendConfig.supabaseUrl : 'Not Connected (NEXT_PUBLIC_SUPABASE_URL)'}
+              <div className="p-3.5 bg-[#F8F6F2] border border-[#E7E0D8] rounded-lg min-w-0">
+                <p className="text-[10px] uppercase font-semibold text-[#6B625B]">Target PostgreSQL Host</p>
+                <p className="font-mono text-[11px] text-[#46362F] mt-1 truncate" title={backendConfig.supabaseUrl || CANONICAL_SUPABASE_URL}>
+                  {backendConfig.supabaseUrl || CANONICAL_SUPABASE_URL}
                 </p>
-                <p className="text-[10px] text-[#6B625B] mt-0.5">
-                  {backendConfig.activeKeyVar ? `Using ${backendConfig.activeKeyVar}` : 'SSL / Port 5432 REST API'}
+                <p className="text-[10px] text-[#6B625B] mt-0.5 truncate">
+                  {backendConfig.activeKeyVar
+                    ? `Key variable: ${backendConfig.activeKeyVar}`
+                    : 'Awaiting VITE_SUPABASE_ANON_KEY'}
                 </p>
               </div>
-              <div className="p-3.5 bg-[#F8F6F2] border border-[#E7E0D8] rounded-lg">
+              <div className="p-3.5 bg-[#F8F6F2] border border-[#E7E0D8] rounded-lg min-w-0">
                 <p className="text-[10px] uppercase font-semibold text-[#6B625B]">Tenant Isolation Model</p>
                 <p className="font-medium text-[#46362F] mt-1">Row Level Security (RLS)</p>
-                <p className="text-[10px] text-[#6B625B] mt-0.5">Enforced via get_user_organization_ids()</p>
+                <p className="text-[10px] text-[#6B625B] mt-0.5">
+                  {supabaseVerifiedAt
+                    ? `Verified at ${new Date(supabaseVerifiedAt).toLocaleTimeString()}`
+                    : 'Enforced via get_user_organization_ids()'}
+                </p>
               </div>
             </div>
 
-            {backendConfig.isMisconfigured && (
-              <div className="p-3 bg-[#FDF0F2] border border-[#F8C8CE] rounded-lg text-[#B42335] text-xs font-semibold flex items-center gap-2">
-                <AlertTriangle className="w-4 h-4 shrink-0" />
-                <span>Configuration Error: {backendConfig.configError}</span>
+            {(backendConfig.isMisconfigured || supabaseConfigError) && (
+              <div className="p-4 bg-[#FDF0F2] border border-[#F8C8CE] rounded-xl text-[#B42335] text-xs space-y-2">
+                <div className="flex items-start gap-2 font-bold">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{supabaseConfigError || backendConfig.configError}</span>
+                </div>
+                <p className="text-[11px] text-[#46362F] leading-relaxed">
+                  <strong>How to resolve on Vercel:</strong> Open <strong>Vercel Project Settings &gt; Environment Variables</strong>, set <code className="font-mono bg-white px-1 py-0.5 rounded border border-[#E7E0D8]">VITE_SUPABASE_URL=https://tewaaznazgsmaherddeu.supabase.co</code> and <code className="font-mono bg-white px-1 py-0.5 rounded border border-[#E7E0D8]">VITE_SUPABASE_ANON_KEY</code> (or <code className="font-mono bg-white px-1 py-0.5 rounded border border-[#E7E0D8]">VITE_SUPABASE_PUBLISHABLE_KEY</code>) to the public anon/publishable key from your Supabase Dashboard (Project <code className="font-mono">tewaaznazgsmaherddeu</code> &gt; Settings &gt; API) for <strong>Production, Preview, and Development</strong>, remove any stale placeholder variables, and trigger a <strong>new deployment</strong>.
+                </p>
               </div>
             )}
 
             <div className="p-4 bg-[#F8F6F2] border border-[#E7E0D8] rounded-lg space-y-2">
               <div className="flex items-center gap-2">
-                <Lock className="w-4 h-4 text-[#46362F]" />
+                <Lock className="w-4 h-4 text-[#46362F] shrink-0" />
                 <p className="font-medium text-[#46362F]">Zero-Secret Exposure Security Rule</p>
               </div>
               <p className="text-[11px] text-[#6B625B] leading-relaxed">
-                The client bundle only holds the public anon or publishable key (<code className="font-mono bg-white px-1 py-0.5 rounded border border-[#E7E0D8] text-[#46362F]">NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY</code> or <code className="font-mono bg-white px-1 py-0.5 rounded border border-[#E7E0D8] text-[#46362F]">NEXT_PUBLIC_SUPABASE_ANON_KEY</code>). All authorization and multi-tenant isolation are strictly evaluated inside PostgreSQL database policies via trusted functions. Privileged service-role keys must NEVER be exposed in client bundles.
+                The client bundle only holds the public anon or publishable key (<code className="font-mono bg-white px-1 py-0.5 rounded border border-[#E7E0D8] text-[#46362F]">VITE_SUPABASE_ANON_KEY</code> or <code className="font-mono bg-white px-1 py-0.5 rounded border border-[#E7E0D8] text-[#46362F]">VITE_SUPABASE_PUBLISHABLE_KEY</code>). All authorization and multi-tenant isolation are strictly evaluated inside PostgreSQL database policies via trusted functions. Privileged service-role keys must NEVER be exposed in client bundles.
               </p>
             </div>
           </div>

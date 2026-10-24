@@ -308,15 +308,15 @@ export const AgentPage: React.FC = () => {
       ];
 
   return (
-    <div className="space-y-6 max-w-[1440px] mx-auto">
+    <div className="space-y-5 sm:space-y-6 max-w-[1440px] w-full min-w-0 mx-auto">
       {/* Editorial Header Banner */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pb-3 border-b border-[#E7E0D8]">
-        <div>
-          <div className="flex items-center gap-2.5">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3.5 pb-3 border-b border-[#E7E0D8] min-w-0">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
             <h1 className="font-serif text-2xl sm:text-3xl font-normal tracking-tight text-[#46362F]">
               {BRAND_CONFIG.copilotName} · Decision Room
             </h1>
-            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 text-[10px] font-bold text-[#46362F] bg-[#E8E2F0] rounded-full">
+            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 text-[10px] font-bold text-[#46362F] bg-[#E8E2F0] rounded-full shrink-0">
               <Sparkles className="w-3 h-3 text-[#8A9A83]" />
               <span>Deterministic AI Reasoning</span>
             </span>
@@ -326,9 +326,9 @@ export const AgentPage: React.FC = () => {
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+        <div className="flex flex-wrap items-center justify-between sm:justify-end gap-2 w-full sm:w-auto">
           {/* Quick Scenario Loader Pills (TC1–TC4) */}
-          <div className="flex items-center gap-1 bg-white border border-[#E7E0D8] rounded-lg p-1">
+          <div className="flex flex-wrap items-center gap-1 bg-white border border-[#E7E0D8] rounded-xl p-1">
             <span className="text-[10px] font-bold text-[#6B625B] px-1.5 flex items-center gap-1">
               <FlaskConical className="w-3 h-3 text-[#8A9A83]" />
               <span>Scenarios:</span>
@@ -339,7 +339,7 @@ export const AgentPage: React.FC = () => {
                 type="button"
                 disabled={scenarioStatus === 'loading'}
                 onClick={() => handleSwitchScenario(scId)}
-                className={`px-2 py-1 text-[11px] font-mono font-bold rounded transition-colors cursor-pointer ${
+                className={`px-2.5 py-1 min-h-[32px] text-[11px] font-mono font-bold rounded-lg transition-colors cursor-pointer ${
                   effectiveScenarioId === scId
                     ? 'bg-[#46362F] text-[#D9C6A5]'
                     : 'text-[#46362F] hover:bg-[#F8F6F2]'
@@ -351,12 +351,13 @@ export const AgentPage: React.FC = () => {
           </div>
 
           <button
+            type="button"
             onClick={() => setIsConfirmingClear(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#6B625B] hover:text-[#B42335] bg-white border border-[#E7E0D8] hover:bg-[#FDF0F2] rounded-lg transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] text-xs font-semibold text-[#6B625B] hover:text-[#B42335] bg-white border border-[#E7E0D8] hover:bg-[#FDF0F2] rounded-xl transition-colors cursor-pointer"
             title="Reset conversation dialogue"
           >
             <Trash2 className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Reset History</span>
+            <span>Reset History</span>
           </button>
         </div>
       </div>
@@ -544,43 +545,56 @@ export const AgentPage: React.FC = () => {
       )}
 
       {/* Mobile / Tablet Tab Switcher (< lg) */}
-      <div className="lg:hidden flex items-center p-1 bg-white border border-[#E7E0D8] rounded-xl shadow-2xs">
+      <div
+        role="tablist"
+        aria-label="Decision Room Panels"
+        className="lg:hidden grid grid-cols-3 gap-1 p-1 bg-white border border-[#E7E0D8] rounded-xl shadow-2xs w-full min-w-0"
+      >
         <button
+          type="button"
+          role="tab"
+          aria-selected={mobileTab === 'chat'}
           onClick={() => setMobileTab('chat')}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold rounded-lg transition-all ${
+          className={`flex items-center justify-center gap-1.5 px-2 py-2.5 min-h-[42px] text-[11px] sm:text-xs font-semibold rounded-lg transition-all cursor-pointer min-w-0 ${
             mobileTab === 'chat' ? 'bg-[#46362F] text-white shadow-xs' : 'text-[#6B625B] hover:text-[#46362F]'
           }`}
         >
-          <MessageSquare className="w-3.5 h-3.5" />
-          <span>{BRAND_CONFIG.copilotName}</span>
+          <MessageSquare className="w-3.5 h-3.5 shrink-0" />
+          <span className="truncate">{BRAND_CONFIG.copilotName}</span>
         </button>
         <button
+          type="button"
+          role="tab"
+          aria-selected={mobileTab === 'decision'}
           onClick={() => setMobileTab('decision')}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold rounded-lg transition-all ${
+          className={`flex items-center justify-center gap-1.5 px-2 py-2.5 min-h-[42px] text-[11px] sm:text-xs font-semibold rounded-lg transition-all cursor-pointer min-w-0 ${
             mobileTab === 'decision' ? 'bg-[#46362F] text-white shadow-xs' : 'text-[#6B625B] hover:text-[#46362F]'
           }`}
         >
-          <Calculator className="w-3.5 h-3.5" />
-          <span>Replenishment Decision</span>
+          <Calculator className="w-3.5 h-3.5 shrink-0" />
+          <span className="truncate">Replenishment Decision</span>
         </button>
         <button
+          type="button"
+          role="tab"
+          aria-selected={mobileTab === 'evidence'}
           onClick={() => setMobileTab('evidence')}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold rounded-lg transition-all ${
+          className={`flex items-center justify-center gap-1.5 px-2 py-2.5 min-h-[42px] text-[11px] sm:text-xs font-semibold rounded-lg transition-all cursor-pointer min-w-0 ${
             mobileTab === 'evidence' ? 'bg-[#46362F] text-white shadow-xs' : 'text-[#6B625B] hover:text-[#46362F]'
           }`}
         >
-          <Compass className="w-3.5 h-3.5" />
-          <span>Signals & Evidence</span>
+          <Compass className="w-3.5 h-3.5 shrink-0" />
+          <span className="truncate">Signals & Evidence</span>
         </button>
       </div>
 
       {/* Balanced 3-Column Desktop Grid: 4 cols Left, 5 cols Center, 3 cols Right */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-stretch">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-stretch w-full min-w-0">
         
         {/* ======================================================== */}
         {/* PANEL 1 (LEFT): RESTOCKIQ COPILOT CONVERSATION (4 cols)  */}
         {/* ======================================================== */}
-        <div className={`lg:col-span-4 bg-white border border-[#E7E0D8] rounded-2xl flex flex-col h-[820px] overflow-hidden shadow-xs ${
+        <div className={`lg:col-span-4 bg-white border border-[#E7E0D8] rounded-2xl flex flex-col h-[540px] sm:h-[640px] lg:h-[820px] min-w-0 overflow-hidden shadow-xs ${
           mobileTab !== 'chat' ? 'hidden lg:flex' : 'flex'
         }`}>
           {/* Aligned Header */}
@@ -703,7 +717,7 @@ export const AgentPage: React.FC = () => {
         {/* ======================================================== */}
         {/* PANEL 2 (CENTER): REPLENISHMENT DECISION (5 cols)        */}
         {/* ======================================================== */}
-        <div className={`lg:col-span-5 bg-white border border-[#E7E0D8] rounded-2xl flex flex-col h-[820px] overflow-hidden shadow-xs ${
+        <div className={`lg:col-span-5 bg-white border border-[#E7E0D8] rounded-2xl flex flex-col min-h-[300px] lg:h-[820px] min-w-0 overflow-hidden shadow-xs ${
           mobileTab !== 'decision' ? 'hidden lg:flex' : 'flex'
         }`}>
           {/* Aligned Header */}
@@ -722,22 +736,24 @@ export const AgentPage: React.FC = () => {
 
           {/* Scrollable Decision Workspace */}
           {!activeItem || !activeSupplier || !calculation ? (
-            <div className="flex-1 p-8 flex flex-col items-center justify-center text-center space-y-3">
+            <div className="flex-1 py-10 px-6 flex flex-col items-center justify-center text-center space-y-3">
               <p className="text-sm font-bold text-[#46362F]">No recommendations available yet.</p>
               <p className="text-xs text-[#6B625B] max-w-xs">
                 Add inventory items and supplier specifications or select an official test scenario (TC1–TC4) above to calculate replenishment needs.
               </p>
               <div className="flex flex-wrap items-center justify-center gap-2">
                 <button
+                  type="button"
                   onClick={() => navigate('/inventory')}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-[#46362F] hover:bg-[#342721] rounded-xl transition-colors"
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-[#46362F] hover:bg-[#342721] rounded-xl transition-colors cursor-pointer"
                 >
                   <Plus className="w-3.5 h-3.5" />
                   <span>Add Inventory Items</span>
                 </button>
                 <button
+                  type="button"
                   onClick={() => handleSwitchScenario('TC1')}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-[#46362F] bg-[#E8E2F0] hover:bg-[#D9C6A5]/60 rounded-xl transition-colors"
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-[#46362F] bg-[#E8E2F0] hover:bg-[#D9C6A5]/60 rounded-xl transition-colors cursor-pointer"
                 >
                   <FlaskConical className="w-3.5 h-3.5" />
                   <span>Load Scenario TC1</span>
@@ -903,7 +919,7 @@ export const AgentPage: React.FC = () => {
         {/* ======================================================== */}
         {/* PANEL 3 (RIGHT): SIGNALS & SOURCE EVIDENCE (3 cols)      */}
         {/* ======================================================== */}
-        <div className={`lg:col-span-3 bg-white border border-[#E7E0D8] rounded-2xl flex flex-col h-[820px] overflow-hidden shadow-xs ${
+        <div className={`lg:col-span-3 bg-white border border-[#E7E0D8] rounded-2xl flex flex-col min-h-[260px] lg:h-[820px] min-w-0 overflow-hidden shadow-xs ${
           mobileTab !== 'evidence' ? 'hidden lg:flex' : 'flex'
         }`}>
           {/* Aligned Header */}
@@ -922,7 +938,7 @@ export const AgentPage: React.FC = () => {
 
           {/* Scrollable Content */}
           {!activeItem || !activeSupplier || !priceCheck ? (
-            <div className="flex-1 p-6 flex items-center justify-center text-center text-xs text-[#6B625B]">
+            <div className="flex-1 py-10 px-6 flex items-center justify-center text-center text-xs text-[#6B625B]">
               No SKU selected. Add inventory items or select a scenario (TC1–TC4) to inspect source evidence and supplier signals.
             </div>
           ) : (
