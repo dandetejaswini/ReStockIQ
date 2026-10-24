@@ -1,0 +1,126 @@
+import { Supplier } from '../types';
+
+export const SEED_SUPPLIERS: Supplier[] = [
+  {
+    id: 'SUP-001',
+    name: 'Apex Logistics & Packaging',
+    contactInformation: {
+      email: 'orders@apexpackaging.in',
+      phone: '+91 98201 54321',
+      representative: 'Rajesh Sharma',
+      address: 'Plot 42, MIDC Industrial Area, Andheri East, Mumbai 400093',
+    },
+    leadTimeDays: 4,
+    packSize: 12,
+    minimumOrderQuantity: 12,
+    currentUnitPrice: 120,
+    previousUnitPrice: 120,
+    priceHistory: [
+      { date: '2026-01-10', price: 120 },
+      { date: '2026-04-15', price: 120 },
+      { date: '2026-08-01', price: 120 },
+    ],
+    status: 'Active',
+  },
+  {
+    id: 'SUP-002',
+    name: 'Malabar Organics & Spice Co',
+    contactInformation: {
+      email: 'wholesale@malabarorganics.com',
+      phone: '+91 94471 23456',
+      representative: 'Ananya Nair',
+      address: 'Kinfra Spice Park, Willingdon Island, Kochi 682003',
+    },
+    leadTimeDays: 5,
+    packSize: 1,
+    minimumOrderQuantity: 10,
+    currentUnitPrice: 450,
+    previousUnitPrice: 450,
+    priceHistory: [
+      { date: '2026-02-12', price: 440 },
+      { date: '2026-06-20', price: 450 },
+    ],
+    status: 'Active',
+  },
+  {
+    id: 'SUP-003',
+    name: 'Sunfield Agri Packaging',
+    contactInformation: {
+      email: 'b2b@sunfieldpackaging.in',
+      phone: '+91 98860 99881',
+      representative: 'Vikram Mehta',
+      address: 'Sector 8, Peenya Industrial Area, Bengaluru 560058',
+    },
+    leadTimeDays: 6,
+    packSize: 25,
+    minimumOrderQuantity: 50,
+    currentUnitPrice: 62.50, // Jumped from 50.00 (+25.0%) -> Triggers TC4
+    previousUnitPrice: 50.00,
+    priceHistory: [
+      { date: '2026-01-05', price: 48.00 },
+      { date: '2026-05-15', price: 50.00 },
+      { date: '2026-10-01', price: 62.50 },
+    ],
+    status: 'Under Review',
+  },
+  {
+    id: 'SUP-004',
+    name: 'Precision Glassware India',
+    contactInformation: {
+      email: 'procurement@precisionglass.co.in',
+      phone: '+91 97112 88776',
+      representative: 'Kavita Sundaram',
+      address: 'Glass Valley, Firozabad Industrial Corridor, UP 283203',
+    },
+    leadTimeDays: 4,
+    packSize: 12, // Case of 12 for TC2
+    minimumOrderQuantity: 24,
+    currentUnitPrice: 85,
+    previousUnitPrice: 85,
+    priceHistory: [
+      { date: '2026-02-01', price: 82 },
+      { date: '2026-07-10', price: 85 },
+    ],
+    status: 'Active',
+  },
+  {
+    id: 'SUP-005',
+    name: 'Deccan Beverages & Extractors',
+    contactInformation: {
+      email: 'dispatch@deccanbeverages.com',
+      phone: '+91 98490 33441',
+      representative: 'Suresh Reddy',
+      address: 'Cherlapally Phase 2, Hyderabad 500051',
+    },
+    leadTimeDays: 3,
+    packSize: 10,
+    minimumOrderQuantity: 20,
+    currentUnitPrice: 210,
+    previousUnitPrice: 210,
+    priceHistory: [
+      { date: '2026-03-01', price: 205 },
+      { date: '2026-08-14', price: 210 },
+    ],
+    status: 'Active',
+  },
+  {
+    id: 'SUP-006',
+    name: 'Vardhman Eco Containers',
+    contactInformation: {
+      email: 'support@vardhmaneco.in',
+      phone: '+91 98140 11223',
+      representative: 'Gurpreet Singh',
+      address: 'Industrial Area A, Ludhiana 141003',
+    },
+    leadTimeDays: 7,
+    packSize: 20,
+    minimumOrderQuantity: 40,
+    currentUnitPrice: 145,
+    previousUnitPrice: 145,
+    priceHistory: [
+      { date: '2026-01-15', price: 140 },
+      { date: '2026-06-01', price: 145 },
+    ],
+    status: 'Active',
+  },
+];

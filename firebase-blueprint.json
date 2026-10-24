@@ -1,0 +1,67 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "ReStockIQ user profile containing operator credentials, store assignment, and onboarding state",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Authentication User ID",
+          "maxLength": 128
+        },
+        "email": {
+          "type": "string",
+          "description": "User contact and procurement email",
+          "maxLength": 255
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Full name of store procurement manager",
+          "maxLength": 255
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "User avatar photo URL",
+          "maxLength": 1024
+        },
+        "provider": {
+          "type": "string",
+          "description": "Authentication provider method",
+          "enum": ["google.com", "password", "custom"]
+        },
+        "storeName": {
+          "type": "string",
+          "description": "Store, warehouse, or enterprise branch name",
+          "maxLength": 255
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable profile creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last profile modification"
+        },
+        "lastLoginAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of most recent authentication session"
+        },
+        "onboardingCompleted": {
+          "type": "boolean",
+          "description": "Flag indicating store lead governance acknowledgement and configuration"
+        }
+      },
+      "required": ["uid", "email"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Single-tenant user profile document indexed by Firebase Authentication UID"
+    }
+  }
+}

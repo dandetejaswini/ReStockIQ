@@ -1,0 +1,6 @@
+{
+  "name": "StockPilot AI — Intelligent Inventory Reorder Planner",
+  "description": "An intelligent inventory copilot that predicts stockouts during supplier lead time, calculates explainable reorder quantities, and streamlines purchase approvals.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

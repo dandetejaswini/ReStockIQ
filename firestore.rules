@@ -1,0 +1,85 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global Default Deny Catch-All Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Helper Functions
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Validation Blueprint for UserProfile Entity (prohibits role/admin self-escalation)
+    function isValidUserProfile(data) {
+      return data.uid is string && 
+             data.uid == request.auth.uid &&
+             data.uid.size() <= 128 &&
+             data.email is string && 
+             data.email.size() > 0 &&
+             data.email.size() <= 255 &&
+             !('role' in data) &&
+             !('isAdmin' in data) &&
+             !('organizationId' in data) &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 255)) &&
+             (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 1024)) &&
+             (!('storeName' in data) || (data.storeName is string && data.storeName.size() <= 255)) &&
+             (!('provider' in data) || (data.provider is string && data.provider in ['google.com', 'password', 'custom'])) &&
+             (!('onboardingCompleted' in data) || data.onboardingCompleted is bool);
+    }
+
+    // Users Collection Rule Match
+    match /users/{userId} {
+      // Direct document inspection (PII Isolation: Only the verified owner can read their own profile)
+      allow get: if isValidId(userId) && isOwner(userId);
+      
+      // Prohibit list queries to prevent user directory enumeration
+      allow list: if false;
+
+      // Create: Owner-only, mandatory server timestamp for createdAt, strict schema
+      allow create: if isValidId(userId) && 
+                       isOwner(userId) && 
+                       isValidUserProfile(incoming()) && 
+                       incoming().uid == userId &&
+                       incoming().createdAt == request.time;
+
+      // Update: Owner-only, immutable identity fields (uid, email, createdAt), limited affected keys
+      allow update: if isValidId(userId) && 
+                       isOwner(userId) && 
+                       isValidUserProfile(incoming()) && 
+                       incoming().uid == existing().uid && 
+                       incoming().email == existing().email && 
+                       incoming().createdAt == existing().createdAt && 
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'displayName', 
+                         'photoURL', 
+                         'storeName', 
+                         'onboardingCompleted', 
+                         'updatedAt', 
+                         'lastLoginAt', 
+                         'provider'
+                       ]);
+
+      // Deletion from browser client is disabled
+      allow delete: if false;
+    }
+  }
+}
