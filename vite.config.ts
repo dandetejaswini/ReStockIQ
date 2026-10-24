@@ -25,7 +25,20 @@ export default defineConfig(() => {
   const fbStorageBucket = process.env.VITE_FIREBASE_STORAGE_BUCKET || process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET || '';
   const fbSenderId = process.env.VITE_FIREBASE_MESSAGING_SENDER_ID || process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID || '';
   const fbAppId = process.env.VITE_FIREBASE_APP_ID || process.env.NEXT_PUBLIC_FIREBASE_APP_ID || '';
-  const fbDatabaseId = process.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID || process.env.NEXT_PUBLIC_FIREBASE_FIRESTORE_DATABASE_ID || '';
+  const rawFbDatabaseId = (
+    process.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID ||
+    process.env.NEXT_PUBLIC_FIREBASE_FIRESTORE_DATABASE_ID ||
+    ''
+  ).trim();
+  const isDefaultOrPlaceholderDb =
+    !rawFbDatabaseId ||
+    rawFbDatabaseId.toLowerCase() === '(default)' ||
+    rawFbDatabaseId.toLowerCase() === 'default' ||
+    rawFbDatabaseId.toLowerCase().includes('your_firestore_') ||
+    rawFbDatabaseId.toLowerCase().includes('your_firebase_');
+  const fbDatabaseId = isDefaultOrPlaceholderDb
+    ? 'ai-studio-stockpilotaiinte-017db4c7-23ad-4924-b3e1-197cbaf1a0ac'
+    : rawFbDatabaseId;
 
   return {
     envPrefix: ['VITE_', 'NEXT_PUBLIC_'],

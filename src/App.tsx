@@ -22,8 +22,9 @@ import { SettingsPage } from './pages/SettingsPage';
 import { DailyBriefingPage } from './pages/DailyBriefingPage';
 
 const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { firebaseUser, userProfile, isLoading } = useAuth();
+  const { firebaseUser, userProfile, isLoading, workspaceError, retryWorkspaceLoad, clearError } = useAuth();
   const { currentUser } = useApp();
+  const [isRetrying, setIsRetrying] = React.useState(false);
 
   if (isLoading) {
     return (
@@ -42,8 +43,36 @@ const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) =
     firebaseUser && userProfile && (!userProfile.onboardingCompleted || !userProfile.storeName)
   );
 
+  const handleRetry = async () => {
+    setIsRetrying(true);
+    await retryWorkspaceLoad();
+    setIsRetrying(false);
+  };
+
   return (
     <AppLayout>
+      {workspaceError && (
+        <div className="mb-4 p-3 bg-[#FDF0F2] border border-[#F8C8CE] rounded-xl text-[#B42335] text-xs font-semibold flex flex-wrap items-center justify-between gap-3">
+          <span>{workspaceError}</span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleRetry}
+              disabled={isRetrying}
+              className="px-2.5 py-1 rounded-md bg-white border border-[#F8C8CE] text-[#46362F] hover:bg-[#F8F6F2] text-[11px] font-semibold transition-colors disabled:opacity-50"
+            >
+              {isRetrying ? 'Retrying...' : 'Retry'}
+            </button>
+            <button
+              type="button"
+              onClick={clearError}
+              className="px-2 py-1 text-[11px] text-[#6B625B] hover:text-[#46362F]"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
       {children}
       <GoogleOnboardingModal
         isOpen={requiresStoreOnboarding}

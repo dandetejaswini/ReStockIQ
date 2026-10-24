@@ -1,18 +1,25 @@
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Sparkles, ShieldCheck, ArrowRight, Eye, EyeOff, CheckCircle2, AlertTriangle } from 'lucide-react';
+import { Sparkles, ShieldCheck, ArrowRight, Eye, EyeOff, CheckCircle2, AlertTriangle, RefreshCw } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { useAuth } from '../context/AuthContext';
+import { sanitizeUserFacingError } from '../lib/firebase';
 import { signUpUser, isSupabaseReady } from '../services/supabaseClient';
 import { getBackendConfig } from '../services/config';
 import { GoogleOnboardingModal } from '../components/onboarding/GoogleOnboardingModal';
-import { syncUserProfileOnLogin } from '../services/userProfileService';
-import { auth } from '../lib/firebase';
 
 export const SignupPage: React.FC = () => {
   const navigate = useNavigate();
   const { loginUser } = useApp();
-  const { signUpWithEmail, signInWithGoogle } = useAuth();
+  const {
+    signUpWithEmail,
+    signInWithGoogle,
+    submitOnboarding,
+    firebaseUser,
+    workspaceError,
+    retryWorkspaceLoad,
+    clearError,
+  } = useAuth();
 
   const [fullName, setFullName] = useState('');
   const [storeName, setStoreName] = useState('');
@@ -25,6 +32,7 @@ export const SignupPage: React.FC = () => {
   const [confirmationNotice, setConfirmationNotice] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isGoogleLoading, setIsGoogleLoading] = useState(false);
+  const [isRetryingWorkspace, setIsRetryingWorkspace] = useState(false);
   const [googleSuccess, setGoogleSuccess] = useState<string | null>(null);
   const [isOnboardingModalOpen, setIsOnboardingModalOpen] = useState(false);
 
@@ -106,8 +114,9 @@ export const SignupPage: React.FC = () => {
   };
 
   const handleGoogleSignUp = async () => {
-    if (isLoading || isGoogleLoading) return;
+    if (isLoading || isGoogleLoading || isRetryingWorkspace) return;
     setError('');
+    clearError();
     setGoogleSuccess(null);
     setIsGoogleLoading(true);
 
@@ -116,15 +125,10 @@ export const SignupPage: React.FC = () => {
 
     if (res.success && res.profile) {
       setGoogleSuccess(`Google account verified (${res.profile.email})`);
-      // If user typed a store name in the input box before clicking Google, save it directly
+      // If user typed a store name in the input box before clicking Google, save it directly via submitOnboarding
       if (storeName.trim() && (!res.profile.storeName || !res.profile.onboardingCompleted)) {
         try {
-          if (auth.currentUser) {
-            await syncUserProfileOnLogin(auth.currentUser, {
-              storeName: storeName.trim(),
-              onboardingCompleted: true,
-            });
-          }
+          await submitOnboarding(storeName.trim());
         } catch (syncErr) {
           console.warn('Failed to pre-attach store name:', syncErr);
         }
@@ -140,9 +144,30 @@ export const SignupPage: React.FC = () => {
         navigate('/home');
       }
     } else if (res.error) {
-      setError(res.error);
+      setError(sanitizeUserFacingError(res.error));
     }
   };
+
+  const handleRetryWorkspace = async () => {
+    if (isRetryingWorkspace) return;
+    setIsRetryingWorkspace(true);
+    setError('');
+    const res = await retryWorkspaceLoad();
+    setIsRetryingWorkspace(false);
+
+    if (res.success && res.profile) {
+      loginUser(res.profile.email, res.profile.displayName, false);
+      if (!res.profile.onboardingCompleted || !res.profile.storeName) {
+        setIsOnboardingModalOpen(true);
+      } else {
+        navigate('/home');
+      }
+    } else if (res.error) {
+      setError(sanitizeUserFacingError(res.error));
+    }
+  };
+
+  const activeError = error || workspaceError;
 
   return (
     <div className="min-h-screen bg-[#F8F6F2] flex flex-col justify-center items-center p-4 font-sans">
@@ -211,10 +236,23 @@ export const SignupPage: React.FC = () => {
             </div>
           )}
 
-          {error && (
-            <div className="p-2.5 bg-[#FDF0F2] border border-[#F8C8CE] rounded-lg text-[#B42335] text-xs font-semibold flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 shrink-0" />
-              <span>{error}</span>
+          {activeError && (
+            <div className="p-2.5 bg-[#FDF0F2] border border-[#F8C8CE] rounded-lg text-[#B42335] text-xs font-semibold flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 shrink-0" />
+                <span>{sanitizeUserFacingError(activeError)}</span>
+              </div>
+              {firebaseUser && (
+                <button
+                  type="button"
+                  onClick={handleRetryWorkspace}
+                  disabled={isRetryingWorkspace}
+                  className="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white border border-[#F8C8CE] text-[#46362F] hover:bg-[#F8F6F2] text-[11px] font-semibold transition-colors disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3 h-3 ${isRetryingWorkspace ? 'animate-spin' : ''}`} />
+                  <span>{isRetryingWorkspace ? 'Retrying...' : 'Retry'}</span>
+                </button>
+              )}
             </div>
           )}
 

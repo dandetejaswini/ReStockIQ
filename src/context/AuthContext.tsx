@@ -1,20 +1,29 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
-import { 
+import {
   User as FirebaseUser,
   onAuthStateChanged,
   signInWithPopup,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
-   getAdditionalUserInfo,
+  getAdditionalUserInfo,
   signOut,
-  updateProfile
+  updateProfile,
 } from 'firebase/auth';
-import { auth, googleProvider } from '../lib/firebase';
-import { 
-  UserProfile, 
-  getUserProfile, 
-  syncUserProfileOnLogin, 
-  completeStoreOnboarding 
+import {
+  auth,
+  ensureFirestoreOnline,
+  googleProvider,
+  isFirestoreOfflineError,
+  isFirestorePermissionError,
+  sanitizeUserFacingError,
+} from '../lib/firebase';
+import {
+  UserProfile,
+  buildFallbackUserProfile,
+  getUserProfile,
+  setCachedUserProfile,
+  syncUserProfileOnLogin,
+  completeStoreOnboarding,
 } from '../services/userProfileService';
 import { syncFirebaseWorkspaceAndWelcomeEmail } from '../services/emailAutomationService';
 
@@ -23,18 +32,30 @@ export interface AuthContextType {
   userProfile: UserProfile | null;
   isLoading: boolean;
   authError: string | null;
+  workspaceError: string | null;
   clearError: () => void;
-  signInWithGoogle: () => Promise<{ success: boolean; profile?: UserProfile; needsOnboarding?: boolean; error?: string }>;
+  retryWorkspaceLoad: () => Promise<{ success: boolean; profile?: UserProfile; error?: string }>;
+  signInWithGoogle: () => Promise<{
+    success: boolean;
+    profile?: UserProfile;
+    needsOnboarding?: boolean;
+    error?: string;
+  }>;
   signInWithEmail: (email: string, password: string) => Promise<{ success: boolean; error?: string }>;
-  signUpWithEmail: (email: string, password: string, fullName: string, storeName: string) => Promise<{ success: boolean; error?: string }>;
+  signUpWithEmail: (
+    email: string,
+    password: string,
+    fullName: string,
+    storeName: string
+  ) => Promise<{ success: boolean; error?: string }>;
   logout: () => Promise<void>;
   submitOnboarding: (storeName: string) => Promise<{ success: boolean; error?: string }>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-function formatAuthError(error: any): string {
-  const code = error?.code || '';
+export function formatAuthError(error: any): string {
+  const code = String(error?.code || '');
   switch (code) {
     case 'auth/popup-closed-by-user':
       return 'Sign-in cancelled. The Google sign-in window was closed before finishing.';
@@ -55,11 +76,17 @@ function formatAuthError(error: any): string {
     case 'auth/weak-password':
       return 'Password should be at least 6 characters.';
     case 'auth/network-request-failed':
-      return 'Network connection failed. Please check your internet connection.';
+      return "We couldn't load your workspace. Check your connection and try again.";
     case 'auth/too-many-requests':
       return 'Access temporarily disabled due to too many failed attempts. Please try again later.';
     default:
-      return error?.message || 'Authentication error. Please try again.';
+      if (isFirestoreOfflineError(error)) {
+        return "We couldn't load your workspace. Check your connection and try again.";
+      }
+      if (isFirestorePermissionError(error)) {
+        return 'Your account was authenticated, but workspace profile permissions could not be verified. Please try again.';
+      }
+      return sanitizeUserFacingError(error, 'Authentication error. Please try again.');
   }
 }
 
@@ -68,36 +95,137 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+
   const isGooglePopupInFlight = useRef<boolean>(false);
+  const isExplicitAuthFlowRef = useRef<boolean>(false);
+  const inFlightWorkspaceSyncRef = useRef<{ uid: string; promise: Promise<UserProfile> } | null>(null);
+
+  const initializeUserWorkspace = async (
+    user: FirebaseUser,
+    options?: {
+      fullName?: string;
+      storeName?: string;
+      onboardingCompleted?: boolean;
+      isSignup?: boolean;
+      force?: boolean;
+    }
+  ): Promise<UserProfile> => {
+    // Reuse in-flight initialization for the same user unless explicitly forced with new overrides
+    if (
+      !options?.force &&
+      !options?.storeName &&
+      inFlightWorkspaceSyncRef.current &&
+      inFlightWorkspaceSyncRef.current.uid === user.uid
+    ) {
+      return inFlightWorkspaceSyncRef.current.promise;
+    }
+
+    const syncTask = (async (): Promise<UserProfile> => {
+      setWorkspaceError(null);
+
+      // Ensure auth token is available before Firestore / API calls
+      try {
+        await user.getIdToken();
+      } catch {
+        // Proceed with cached auth state if offline
+      }
+
+      let existingProfile: UserProfile | null = null;
+      try {
+        existingProfile = await getUserProfile(user.uid, { allowOfflineFallback: true });
+      } catch (readErr) {
+        if (isFirestoreOfflineError(readErr)) {
+          setWorkspaceError("We couldn't load your workspace. Check your connection and try again.");
+        }
+      }
+
+      const isNewAccount = Boolean(options?.isSignup || !existingProfile);
+      const candidateStoreName = options?.storeName || existingProfile?.storeName || undefined;
+      const candidateFullName =
+        options?.fullName ||
+        existingProfile?.displayName ||
+        user.displayName ||
+        user.email?.split('@')[0] ||
+        'Store Procurement Lead';
+
+      // Sync canonical Supabase workspace & welcome email in parallel/sequence
+      const wsRes = await syncFirebaseWorkspaceAndWelcomeEmail(user, {
+        fullName: candidateFullName,
+        storeName: candidateStoreName,
+        isSignup: isNewAccount,
+        force: options?.force,
+      });
+
+      // Reconcile storeName from canonical Supabase workspace if Firestore profile didn't have it yet
+      const supabaseOrgName = wsRes.workspace?.organization_name?.trim() || '';
+      const hasCustomSupabaseStore =
+        Boolean(supabaseOrgName) &&
+        !supabaseOrgName.endsWith("'s Store") &&
+        supabaseOrgName.toLowerCase() !== 'default store';
+
+      const resolvedStoreName =
+        options?.storeName ||
+        existingProfile?.storeName ||
+        (hasCustomSupabaseStore ? supabaseOrgName : '');
+
+      const resolvedOnboarding =
+        typeof options?.onboardingCompleted === 'boolean'
+          ? options.onboardingCompleted
+          : Boolean(existingProfile?.onboardingCompleted && existingProfile?.storeName) ||
+            Boolean(resolvedStoreName);
+
+      try {
+        const syncedProfile = await syncUserProfileOnLogin(user, {
+          storeName: resolvedStoreName || undefined,
+          onboardingCompleted: resolvedOnboarding,
+          existingProfile,
+          allowOfflineFallback: true,
+        });
+        setUserProfile(syncedProfile);
+        return syncedProfile;
+      } catch (writeErr) {
+        console.warn('Firestore profile sync warning, using authenticated fallback profile:', writeErr);
+        if (isFirestoreOfflineError(writeErr)) {
+          setWorkspaceError("We couldn't load your workspace. Check your connection and try again.");
+        }
+        const fallbackProfile = buildFallbackUserProfile(user, {
+          storeName: resolvedStoreName,
+          onboardingCompleted: resolvedOnboarding,
+        });
+        setUserProfile(fallbackProfile);
+        return fallbackProfile;
+      }
+    })();
+
+    inFlightWorkspaceSyncRef.current = { uid: user.uid, promise: syncTask };
+    try {
+      return await syncTask;
+    } finally {
+      if (inFlightWorkspaceSyncRef.current?.promise === syncTask) {
+        inFlightWorkspaceSyncRef.current = null;
+      }
+    }
+  };
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setFirebaseUser(currentUser);
       if (currentUser) {
+        // If an explicit login/signup method is actively handling initialization, wait for it
+        if (isExplicitAuthFlowRef.current) {
+          return;
+        }
         try {
-          const profile = await getUserProfile(currentUser.uid);
-          if (profile) {
-            setUserProfile(profile);
-            await syncFirebaseWorkspaceAndWelcomeEmail(currentUser, {
-              fullName: profile.displayName,
-              storeName: profile.storeName || undefined,
-              isSignup: false,
-            });
-          } else {
-            // First time or unsynced profile
-            const synced = await syncUserProfileOnLogin(currentUser);
-            setUserProfile(synced);
-            await syncFirebaseWorkspaceAndWelcomeEmail(currentUser, {
-              fullName: synced.displayName,
-              storeName: synced.storeName || undefined,
-              isSignup: false,
-            });
-          }
+          await initializeUserWorkspace(currentUser, { isSignup: false });
         } catch (err) {
-          console.error('Failed to load user profile from Firestore:', err);
+          console.error('Failed to initialize user profile on session restore:', err);
+          const fallback = buildFallbackUserProfile(currentUser);
+          setUserProfile(fallback);
         }
       } else {
         setUserProfile(null);
+        setWorkspaceError(null);
       }
       setIsLoading(false);
     });
@@ -105,66 +233,136 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => unsubscribe();
   }, []);
 
-  const clearError = () => setAuthError(null);
+  const clearError = () => {
+    setAuthError(null);
+    setWorkspaceError(null);
+  };
 
-  const signInWithGoogle = async (): Promise<{ 
-    success: boolean; 
-    profile?: UserProfile; 
-    needsOnboarding?: boolean; 
-    error?: string 
+  const retryWorkspaceLoad = async (): Promise<{
+    success: boolean;
+    profile?: UserProfile;
+    error?: string;
+  }> => {
+    const activeUser = auth.currentUser || firebaseUser;
+    if (!activeUser) {
+      return {
+        success: false,
+        error: 'No authenticated user session found. Please sign in again.',
+      };
+    }
+
+    setIsLoading(true);
+    setAuthError(null);
+    setWorkspaceError(null);
+
+    try {
+      await ensureFirestoreOnline();
+      const profile = await initializeUserWorkspace(activeUser, { force: true });
+      setUserProfile(profile);
+      setIsLoading(false);
+      return { success: true, profile };
+    } catch (err: any) {
+      setIsLoading(false);
+      const friendlyMsg = formatAuthError(err);
+      setWorkspaceError(friendlyMsg);
+      return { success: false, error: friendlyMsg };
+    }
+  };
+
+  const signInWithGoogle = async (): Promise<{
+    success: boolean;
+    profile?: UserProfile;
+    needsOnboarding?: boolean;
+    error?: string;
   }> => {
     if (isGooglePopupInFlight.current) {
       return { success: false, error: 'A Google sign-in request is already in progress.' };
     }
     isGooglePopupInFlight.current = true;
+    isExplicitAuthFlowRef.current = true;
     setIsLoading(true);
     setAuthError(null);
+    setWorkspaceError(null);
+
     try {
       const result = await signInWithPopup(auth, googleProvider);
       const user = result.user;
-      const additionalInfo = getAdditionalUserInfo(result);
-      const existingProfile = await getUserProfile(user.uid);
-      const isNewGoogleRegistration = Boolean(additionalInfo?.isNewUser || !existingProfile);
+      setFirebaseUser(user);
 
-      const profile = await syncUserProfileOnLogin(user);
-      await syncFirebaseWorkspaceAndWelcomeEmail(user, {
-        fullName: profile.displayName,
-        storeName: profile.storeName || undefined,
-        isSignup: isNewGoogleRegistration,
+      const additionalInfo = getAdditionalUserInfo(result);
+      const isNewGoogleUser = Boolean(additionalInfo?.isNewUser);
+
+      const profile = await initializeUserWorkspace(user, {
+        isSignup: isNewGoogleUser,
         force: true,
       });
 
       setUserProfile(profile);
       setIsLoading(false);
       isGooglePopupInFlight.current = false;
+      isExplicitAuthFlowRef.current = false;
 
       const needsOnboarding = !profile.onboardingCompleted || !profile.storeName;
       return { success: true, profile, needsOnboarding };
     } catch (err: any) {
+      // If Firebase Auth itself succeeded (auth.currentUser exists) and only a post-login step threw,
+      // preserve the authenticated session and use the fallback profile rather than failing Google Sign-In.
+      const authenticatedUser = auth.currentUser;
+      if (authenticatedUser && !String(err?.code || '').startsWith('auth/')) {
+        const fallbackProfile = buildFallbackUserProfile(authenticatedUser);
+        setFirebaseUser(authenticatedUser);
+        setUserProfile(fallbackProfile);
+        setIsLoading(false);
+        isGooglePopupInFlight.current = false;
+        isExplicitAuthFlowRef.current = false;
+        if (isFirestoreOfflineError(err)) {
+          setWorkspaceError("We couldn't load your workspace. Check your connection and try again.");
+        }
+        const needsOnboarding = !fallbackProfile.onboardingCompleted || !fallbackProfile.storeName;
+        return { success: true, profile: fallbackProfile, needsOnboarding };
+      }
+
       setIsLoading(false);
       isGooglePopupInFlight.current = false;
+      isExplicitAuthFlowRef.current = false;
       const friendlyMsg = formatAuthError(err);
       setAuthError(friendlyMsg);
       return { success: false, error: friendlyMsg };
     }
   };
 
-  const signInWithEmail = async (email: string, password: string): Promise<{ success: boolean; error?: string }> => {
+  const signInWithEmail = async (
+    email: string,
+    password: string
+  ): Promise<{ success: boolean; error?: string }> => {
+    isExplicitAuthFlowRef.current = true;
     setIsLoading(true);
     setAuthError(null);
+    setWorkspaceError(null);
     try {
       const result = await signInWithEmailAndPassword(auth, email, password);
-      const profile = await syncUserProfileOnLogin(result.user);
-      await syncFirebaseWorkspaceAndWelcomeEmail(result.user, {
-        fullName: profile.displayName,
-        storeName: profile.storeName || undefined,
+      setFirebaseUser(result.user);
+      const profile = await initializeUserWorkspace(result.user, {
         isSignup: false,
+        force: true,
       });
       setUserProfile(profile);
       setIsLoading(false);
+      isExplicitAuthFlowRef.current = false;
       return { success: true };
     } catch (err: any) {
+      const authenticatedUser = auth.currentUser;
+      if (authenticatedUser && !String(err?.code || '').startsWith('auth/')) {
+        const fallbackProfile = buildFallbackUserProfile(authenticatedUser);
+        setFirebaseUser(authenticatedUser);
+        setUserProfile(fallbackProfile);
+        setIsLoading(false);
+        isExplicitAuthFlowRef.current = false;
+        return { success: true };
+      }
+
       setIsLoading(false);
+      isExplicitAuthFlowRef.current = false;
       const friendlyMsg = formatAuthError(err);
       setAuthError(friendlyMsg);
       return { success: false, error: friendlyMsg };
@@ -172,37 +370,51 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const signUpWithEmail = async (
-    email: string, 
-    password: string, 
-    fullName: string, 
+    email: string,
+    password: string,
+    fullName: string,
     storeName: string
   ): Promise<{ success: boolean; error?: string }> => {
+    isExplicitAuthFlowRef.current = true;
     setIsLoading(true);
     setAuthError(null);
+    setWorkspaceError(null);
     try {
       const result = await createUserWithEmailAndPassword(auth, email, password);
+      setFirebaseUser(result.user);
       if (fullName) {
-        await updateProfile(result.user, { displayName: fullName });
+        await updateProfile(result.user, { displayName: fullName }).catch(() => {});
       }
 
       const resolvedStoreName = storeName || 'Main Store Branch';
-      const profile = await syncUserProfileOnLogin(result.user, {
+      const profile = await initializeUserWorkspace(result.user, {
+        fullName,
         storeName: resolvedStoreName,
         onboardingCompleted: true,
-      });
-
-      await syncFirebaseWorkspaceAndWelcomeEmail(result.user, {
-        fullName: fullName || profile.displayName,
-        storeName: resolvedStoreName,
         isSignup: true,
         force: true,
       });
 
       setUserProfile(profile);
       setIsLoading(false);
+      isExplicitAuthFlowRef.current = false;
       return { success: true };
     } catch (err: any) {
+      const authenticatedUser = auth.currentUser;
+      if (authenticatedUser && !String(err?.code || '').startsWith('auth/')) {
+        const fallbackProfile = buildFallbackUserProfile(authenticatedUser, {
+          storeName: storeName || 'Main Store Branch',
+          onboardingCompleted: true,
+        });
+        setFirebaseUser(authenticatedUser);
+        setUserProfile(fallbackProfile);
+        setIsLoading(false);
+        isExplicitAuthFlowRef.current = false;
+        return { success: true };
+      }
+
       setIsLoading(false);
+      isExplicitAuthFlowRef.current = false;
       const friendlyMsg = formatAuthError(err);
       setAuthError(friendlyMsg);
       return { success: false, error: friendlyMsg };
@@ -215,6 +427,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       await signOut(auth);
       setFirebaseUser(null);
       setUserProfile(null);
+      setAuthError(null);
+      setWorkspaceError(null);
     } catch (err) {
       console.error('Logout error:', err);
     } finally {
@@ -222,20 +436,36 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  const submitOnboarding = async (storeName: string): Promise<{ success: boolean; error?: string }> => {
-    if (!firebaseUser) return { success: false, error: 'No active session' };
+  const submitOnboarding = async (
+    storeName: string
+  ): Promise<{ success: boolean; error?: string }> => {
+    const activeUser = firebaseUser || auth.currentUser;
+    if (!activeUser) return { success: false, error: 'No active session' };
+    const cleanStoreName = storeName.trim();
     try {
-      await completeStoreOnboarding(firebaseUser.uid, storeName);
-      await syncFirebaseWorkspaceAndWelcomeEmail(firebaseUser, {
-        fullName: userProfile?.displayName || firebaseUser.displayName || undefined,
-        storeName,
+      await completeStoreOnboarding(activeUser.uid, cleanStoreName, activeUser);
+      await syncFirebaseWorkspaceAndWelcomeEmail(activeUser, {
+        fullName: userProfile?.displayName || activeUser.displayName || undefined,
+        storeName: cleanStoreName,
         isSignup: false,
         force: true,
       });
-      setUserProfile(prev => prev ? { ...prev, storeName, onboardingCompleted: true } : null);
+      setUserProfile(prev => {
+        const updated: UserProfile = prev
+          ? { ...prev, storeName: cleanStoreName, onboardingCompleted: true }
+          : buildFallbackUserProfile(activeUser, {
+              storeName: cleanStoreName,
+              onboardingCompleted: true,
+            });
+        setCachedUserProfile(updated);
+        return updated;
+      });
       return { success: true };
     } catch (err: any) {
-      return { success: false, error: err.message || 'Failed to complete store onboarding' };
+      return {
+        success: false,
+        error: formatAuthError(err) || 'Failed to complete store onboarding',
+      };
     }
   };
 
@@ -246,7 +476,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         userProfile,
         isLoading,
         authError,
+        workspaceError,
         clearError,
+        retryWorkspaceLoad,
         signInWithGoogle,
         signInWithEmail,
         signUpWithEmail,
